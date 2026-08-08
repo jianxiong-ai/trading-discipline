@@ -4,6 +4,9 @@ config.yaml
 data/*.json
 data/*.jsonl
 data/*.log
+data/*.db
+data/*.db-shm
+data/*.db-wal
 data/evidence_cache/
 __pycache__/
 .pytest_cache/

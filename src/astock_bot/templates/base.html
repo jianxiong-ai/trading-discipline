@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title }}</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="/">A股持仓纪律</a>
+      <nav>
+        <a href="/">组合看板</a>
+        <a href="/positions">持仓与成交</a>
+        <a href="/watchlist">观察仓与复盘</a>
+      </nav>
+    </header>
+    <main class="page">
+      {% if notice %}<div class="flash success">{{ notice }}</div>{% endif %}
+      {% if error %}<div class="flash error">{{ error }}</div>{% endif %}
+      {% block content %}{% endblock %}
+    </main>
+    <footer>仅作纪律记录与研究辅助，不自动下单。</footer>
+  </body>
+</html>

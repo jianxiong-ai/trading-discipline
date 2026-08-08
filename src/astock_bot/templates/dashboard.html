@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">本地组合台账</p>
+    <h1>先看仓位，再看信号。</h1>
+    <p>成交以台账为准；监控策略与网页读取同一份账户事实。</p>
+  </div>
+  <div class="cash-card"><span>可用资金</span><strong>¥{{ '%.2f'|format(cash) }}</strong></div>
+</section>
+<section class="metrics">
+  <article><span>正式持仓</span><strong>{{ holdings|length }}</strong><small>主仓与卫星仓合并管理</small></article>
+  <article><span>活动卫星仓</span><strong>{{ holdings|selectattr('satellite.active')|list|length }}</strong><small>最长持有期由纪律规则管理</small></article>
+  <article><span>观察标的</span><strong>{{ watchlist|length }}</strong><small>只在严格首次建仓条件通过时提醒</small></article>
+</section>
+<section class="panel">
+  <div class="section-head"><h2>当前持仓</h2><a href="/positions">录入成交 →</a></div>
+  <div class="table-wrap"><table><thead><tr><th>标的</th><th>主仓</th><th>卫星仓</th><th>行业</th><th>状态</th></tr></thead><tbody>
+  {% for p in holdings %}<tr><td><b>{{ p.name }}</b><br><small>{{ p.symbol }}</small></td><td>{{ p.main_shares }}股</td><td>{% if p.satellite.active %}{{ p.satellite.shares }}股{% else %}未启用{% endif %}</td><td>{{ p.sector }}</td><td><span class="tag">正式持仓</span></td></tr>{% else %}<tr><td colspan="5">暂无正式持仓</td></tr>{% endfor %}
+  </tbody></table></div>
+</section>
+<section class="grid-two">
+  <article class="panel"><div class="section-head"><h2>最近日内总结</h2><a href="/watchlist">查看复盘 →</a></div>
+  {% if latest_summary %}
+    <p class="muted">{{ latest_summary.timestamp[:16].replace('T', ' ') }} · {{ latest_summary.decision }}</p>
+    {% for row in latest_summary.summaries[:4] %}<div class="summary-row"><b>{{ row.name }}</b><span>{{ row.recommendation }}</span><small>{{ row.reason }}</small></div>{% endfor %}
+  {% else %}<p class="empty">尚无可展示的日内总结。监控完成首个正式节点后会自动出现。</p>{% endif %}
+  </article>
+  <article class="panel"><div class="section-head"><h2>最近操作信号</h2><span class="muted">未确认成交不改变仓位</span></div>
+  {% for item in recent_actions %}<div class="summary-row"><b>{{ item.node }} · {{ item.decision }}</b><small>{% for signal in item.signals %}{{ signal.name }}：{{ signal.action }}{% if not loop.last %}；{% endif %}{% endfor %}</small></div>{% else %}<p class="empty">近期没有触发操作信号。</p>{% endfor %}
+  </article>
+</section>
+{% endblock %}

@@ -10,6 +10,7 @@ from typing import Any
 import yaml
 
 from .models import Position, SatellitePosition
+from .portfolio_store import PortfolioStore
 
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
@@ -47,8 +48,14 @@ class AppConfig:
 
 
 def load_config(path: str | Path) -> AppConfig:
-    with Path(path).open("r", encoding="utf-8") as handle:
+    config_path = Path(path)
+    with config_path.open("r", encoding="utf-8") as handle:
         raw = _expand(yaml.safe_load(handle) or {})
+    # Strategy rules remain in YAML; confirmed portfolio facts live in the
+    # optional shared SQLite ledger so the monitor and local web UI agree.
+    store = PortfolioStore.from_config(config_path, raw)
+    if store is not None:
+        raw = store.overlay(raw)
     positions: list[Position] = []
     for item in raw.get("portfolio", {}).get("positions", []):
         satellite_raw = item.get("satellite", {})

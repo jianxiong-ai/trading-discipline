@@ -306,6 +306,8 @@ market_indices:
   - 000300.SH
 
 portfolio:
+  # 页面与监控共享的账户台账；首次启动时从本配置初始化，之后成交/观察仓变更写入SQLite。
+  database_path: data/portfolio.db
   available_cash: 12753.41
   positions:
     - symbol: 600362.SH

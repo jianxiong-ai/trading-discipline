@@ -15,3 +15,19 @@ services:
       timeout: 5s
       retries: 3
 
+  web:
+    build: .
+    restart: unless-stopped
+    command: ["uvicorn", "astock_bot.web:app", "--host", "0.0.0.0", "--port", "8787"]
+    environment:
+      ASTOCK_CONFIG: /app/config.yaml
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+    ports:
+      - "127.0.0.1:8787:8787"
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8787/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
