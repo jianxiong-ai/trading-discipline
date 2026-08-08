@@ -1,0 +1,395 @@
+timezone: Asia/Shanghai
+schedule: ["09:15", "10:15", "13:15", "14:15"]
+daily_summary:
+  enabled: true
+  time: "15:30"
+run_window_seconds: 180
+holidays:
+  # 2026 年上交所公布的 A 股休市日；周末另由程序自动跳过。
+  - "2026-01-01"
+  - "2026-01-02"
+  - "2026-01-03"
+  - "2026-02-15"
+  - "2026-02-16"
+  - "2026-02-17"
+  - "2026-02-18"
+  - "2026-02-19"
+  - "2026-02-20"
+  - "2026-02-21"
+  - "2026-02-22"
+  - "2026-02-23"
+  - "2026-04-04"
+  - "2026-04-05"
+  - "2026-04-06"
+  - "2026-05-01"
+  - "2026-05-02"
+  - "2026-05-03"
+  - "2026-05-04"
+  - "2026-05-05"
+  - "2026-06-19"
+  - "2026-06-20"
+  - "2026-06-21"
+  - "2026-09-25"
+  - "2026-09-26"
+  - "2026-09-27"
+  - "2026-10-01"
+  - "2026-10-02"
+  - "2026-10-03"
+  - "2026-10-04"
+  - "2026-10-05"
+  - "2026-10-06"
+  - "2026-10-07"
+state_file: data/state.json
+log_file: data/events.jsonl
+
+data_source:
+  provider: tencent_public
+  timeout_seconds: 8
+  retries: 2
+  max_quote_delay_seconds: 120
+  max_bar_lag_seconds: 300
+  require_previous_trading_day: true
+  daily_lookback: 120
+  intraday_lookback: 600
+  minimum_fresh_peer_count: 2
+  minimum_fresh_index_count: 3
+
+# Public Equity Investing 证据层：只读取一手公开来源，不连接 FactSet。
+# 产业数据为日终证据；公告标题只做风险筛选，经营类PDF正文只提取可核验同比指标。
+evidence:
+  enabled: true
+  timeout_seconds: 8
+  retries: 2
+  cache_enabled: true
+  cache_dir: data/evidence_cache
+  copper:
+    max_age_calendar_days: 4
+    trend_lookback_sessions: 3
+    positive_change_ratio: 0.003
+    negative_change_ratio: -0.003
+    positive_trend_ratio: 0.006
+    negative_trend_ratio: -0.006
+    warrant_enabled: true
+    warrant_change_ratio: 0.03
+  insurance:
+    max_age_calendar_days: 4
+    positive_daily_bp: 1.0
+    negative_daily_bp: -1.0
+    positive_monthly_bp: 0.0
+    negative_monthly_bp: -3.0
+  new_energy_vehicle:
+    max_age_calendar_days: 45
+    positive_sales_yoy_pct: 5.0
+    negative_sales_yoy_pct: -5.0
+  satellite_communications:
+    max_age_calendar_days: 120
+    positive_keywords: [成功发射, 顺利进入预定轨道, 批量颁发, 商用试验, 正式开通]
+    negative_keywords: [发射失败, 任务失败, 发生异常, 事故, 暂停, 撤销许可]
+  semiconductor:
+    max_age_calendar_days: 75
+    positive_ic_output_yoy_pct: 5.0
+    negative_ic_output_yoy_pct: -5.0
+    positive_industry_value_yoy_pct: 3.0
+    negative_industry_value_yoy_pct: -2.0
+  optical_communications:
+    max_age_calendar_days: 45
+    positive_business_volume_yoy_pct: 5.0
+    negative_business_volume_yoy_pct: -3.0
+    positive_fiber_length_yoy_pct: 2.0
+    negative_fiber_length_yoy_pct: -2.0
+    minimum_revenue_yoy_pct: -3.0
+    negative_revenue_yoy_pct: -8.0
+  announcements:
+    lookback_calendar_days: 45
+    risk_window_calendar_days: 7
+    critical_risk_window_calendar_days: 45
+    max_pages: 5
+    max_operating_documents: 2
+    max_pdf_pages: 20
+    operating_change_threshold_pct: 3.0
+    operating_keywords: [保费收入, 经营情况, 主要经营数据, 季度报告, 年度报告]
+    critical_keywords: [立案调查, 立案告知书, 重大违法, 财务造假, 债务逾期, 无法清偿, 破产, 暂停上市, 终止上市, 偿付能力不足, 业绩预亏, 重大资产减值, 评级下调, 被接管]
+    caution_keywords: [诉讼, 仲裁, 行政处罚, 监管警示, 纪律处分, 问询函, 风险提示, 整改, 减持, 对外担保]
+  corporate_actions:
+    enabled: true
+    max_age_calendar_days: 60
+    same_event_window_calendar_days: 2
+    sse_archive_lookahead_days: 1
+    max_pdf_pages: 25
+    minimum_body_characters: 80
+
+margin_financing:
+  enabled: true
+  max_age_calendar_days: 4
+  lookback_calendar_days: 20
+  minimum_observations: 5
+  crowded_change_ratio: 0.08
+  deleveraging_change_ratio: -0.05
+  extreme_crowding_ratio: 0.12
+
+capital_flow:
+  enabled: true
+  max_age_calendar_days: 2
+  lookback_sessions: 5
+  persistent_inflow_yuan: 300000000
+  persistent_outflow_yuan: -300000000
+  single_day_inflow_yuan: 100000000
+  single_day_outflow_yuan: -100000000
+
+shareholder_count:
+  enabled: true
+  max_age_calendar_days: 120
+  concentrate_change_ratio: -0.05
+  disperse_change_ratio: 0.05
+
+execution_constraints:
+  cash_reserve_amount: 0
+  fixed_buy_cost_buffer: 5
+  variable_buy_cost_buffer_ratio: 0.001
+
+liquidity:
+  enabled: true
+  adv_lookback_days: 20
+  minimum_adv_samples: 15
+  max_entry_adv_ratio: 0.01
+  max_routine_trim_adv_ratio: 0.05
+  stressed_exit_adv_ratio: 0.025
+
+notification:
+  webhook: "${FEISHU_WEBHOOK}"
+  secret: "${FEISHU_SECRET}"
+  send_no_alert: false
+  title: A股持仓纪律
+  evidence_char_limit: 240
+  margin_char_limit: 120
+
+risk:
+  max_loss_ratio: 0.25
+  warning_ratio: 0.20
+  near_limit_ratio: 0.225
+  # 按“合并后消息”计数；同事件仍去重，风险退出不受本额度限制。
+  max_strategy_alerts_per_day: 3
+  max_satellite_alerts_per_day: 3
+  max_reminder_alerts_per_day: 3
+  # 旧持仓超出上限时只禁止继续新增，不会仅因本项自动卖出。
+  max_single_position_ratio: 0.30
+  correlation_groups:
+    insurance:
+      symbols: [601336.SH, 601318.SH]
+      max_ratio: 0.40
+
+# 计划金额先按账户净资产比例生成，再受100股整数、现金、单股/行业上限、止损风险和单股安全股数上限约束。
+# 单只股票可在 portfolio.positions[].sizing 中覆盖任一字段。
+position_sizing:
+  initial_main_weight: 0.08
+  trend_add_weight: 0.06
+  target_main_weight: 0.20
+  satellite_weight: 0.03
+  max_single_position_weight: 0.30
+  entry_risk_weight: 0.005
+  watchlist_initial_weight: 0.05
+  watchlist_entry_risk_weight: 0.0035
+
+# 存量仓迁移：以接入时实际风险暴露为只降不升的天花板；确认减仓后按“当前权重+缓冲”下调。
+# 迁移期新增只允许使用已经释放的额度，且25%风险本金上限固定，不因回补而扩大。
+migration_mode:
+  enabled: true
+  main_add_weight: 0.03
+  ratchet_buffer_weight: 0.03
+  rebound_trim_weight: 0.03
+  rebound_resistance_distance_ratio: 0.01
+  rebound_trim_volume_ratio: 1.00
+  minimum_volume_baseline_samples: 3
+  correlation_groups:
+    insurance:
+      initial_ceiling_weight: 0.50061255
+
+strategic_rules:
+  # 只有产业证据明确改善且近期公告标题无风险词时，技术突破才允许生成主仓加仓建议。
+  main_add_enabled: true
+  main_entry_priority_bonus: 0.25
+  minimum_weak_confirmations: 1
+  minimum_strong_confirmations: 2
+  peer_weak_ratio: 0.0
+  peer_relative_strength_buffer_ratio: 0.01
+  market_weak_ratio: -0.003
+  peer_strong_ratio: 0.002
+  market_strong_ratio: 0.003
+  max_cash_fraction_per_add: 1.00
+  minimum_ma20_slope_5d: 0.0
+  require_aligned_short_trend: true
+  breakout_retest_tolerance_ratio: 0.002
+  breakout_stop_buffer_ratio: 0.010
+  minimum_expected_spread_ratio: 0.04
+  minimum_reward_risk: 1.80
+  max_remaining_risk_capacity_fraction: 0.10
+  emergency_gap_down_ratio: 0.02
+  down_break_min_depth_ratio: 0.003
+  down_break_atr_multiplier: 0.10
+  shallow_relative_strength_observation_only: true
+  high_break_requires_depth: true
+  high_break_minimum_weak_confirmations: 2
+  medium_confidence_reduction_ratio: 0.15
+  high_confidence_reduction_ratio: 0.25
+
+watchlist_rules:
+  enabled: true
+  starter_cooldown_trading_days: 3
+  allowed_nodes: ["10:15", "13:15", "14:15"]
+  minimum_strong_confirmations: 2
+  peer_minimum: -0.003
+  market_minimum: -0.005
+  minimum_expected_spread_ratio: 0.05
+  minimum_reward_risk: 2.00
+  max_cash_fraction_per_entry: 1.00
+
+satellite_rules:
+  max_holding_trading_days: 10
+  support_distance_ratio: 0.008
+  minimum_expected_spread_ratio: 0.03
+  minimum_reward_risk: 1.80
+  invalidation_buffer_ratio: 0.015
+  volume_confirmation_ratio: 1.30
+  minimum_volume_baseline_samples: 3
+  max_active_positions: 1
+  max_cash_fraction_per_trade: 1.00
+  max_remaining_risk_capacity_fraction: 0.10
+  minimum_peer_change_ratio: -0.003
+  minimum_market_change_ratio: -0.005
+  target_near_ratio: 0.005
+  emergency_gap_below_stop_ratio: 0.01
+  support_distance_atr_multiplier: 0.50
+  support_distance_min_ratio: 0.004
+  support_distance_max_ratio: 0.012
+  stop_atr_multiplier: 0.90
+  stop_buffer_min_ratio: 0.010
+  stop_buffer_max_ratio: 0.025
+  reversal_expansion_volume_ratio: 1.20
+  contraction_volume_ratio_min: 0.60
+  minimum_target_atr_multiplier: 1.50
+
+stage_rules:
+  bottom_range_max: 0.25
+  bottom_tracking_range_max: 0.35
+  bottom_rsi_seen_max: 38
+  bottom_rsi_recovery_min: 35
+  bottom_ma20_slope_min: -0.012
+  bottom_peer_minimum: -0.003
+  bottom_market_minimum: -0.005
+  bottom_confirmation_score: 5
+  bottom_reentry_minimum_spread_ratio: 0.05
+  top_range_min: 0.80
+  top_high_distance_ratio: 0.04
+  top_tracking_drawdown_ratio: 0.08
+  top_rsi_seen_min: 68
+  top_atr_extension_min: 1.50
+  overheat_watch_enabled: true
+  overheat_atr_extension_min: 3.0
+  overheat_rsi_min: 70
+  top_reversal_volume_ratio: 1.00
+  top_peer_strong_limit: 0.00
+  top_market_strong_limit: 0.00
+  top_confirmation_score: 5
+  high_top_score: 6
+  top_trim_ratio: 0.25
+  high_top_trim_ratio: 0.50
+  full_exit_enabled: true
+  full_exit_requires_company_thesis_break: true
+  top_full_exit_drawdown_ratio: 0.03
+  top_state_max_calendar_days: 45
+  top_state_reset_drawdown_ratio: 0.20
+
+market_indices:
+  - 000001.SH
+  - 399001.SZ
+  - 399006.SZ
+  - 000300.SH
+
+portfolio:
+  available_cash: 12753.41
+  positions:
+    - symbol: 600362.SH
+      name: 江西铜业
+      role: holding
+      main_shares: 1800
+      economic_basis: 87720.00
+      sector: copper
+      satellite_limit: 300
+      # 仅为单次主仓新增的安全股数上限；实际计划由 position_sizing 决定。
+      main_adjustment_shares: 500
+      migration:
+        enabled: true
+        initial_ceiling_weight: 0.42855855
+        risk_principal_ceiling: 87720.00
+      peers: [601899.SH, 000630.SZ, 000878.SZ]
+      satellite:
+        active: false
+        shares: 0
+        entry_price: null
+        entry_date: null
+        entry_support: null
+        target_price: null
+        stop_price: null
+
+    - symbol: 601336.SH
+      name: 新华保险
+      role: holding
+      main_shares: 1000
+      economic_basis: 75809.93
+      sector: insurance
+      satellite_limit: 100
+      main_adjustment_shares: 300
+      migration:
+        enabled: true
+        initial_ceiling_weight: 0.34999559
+        risk_principal_ceiling: 75809.93
+      peers: [601628.SH, 601601.SH, 601319.SH]
+      # 现金分红示例：股权登记日禁止常规减仓；除息后将 basis_adjusted 设为 true 并下调 economic_basis。
+      # corporate_events:
+      #   - type: cash_dividend
+      #     record_date: "2026-08-06"
+      #     ex_date: "2026-08-07"
+      #     cash_per_share: 2.06
+      #     basis_adjusted: false
+      satellite:
+        active: false
+        shares: 0
+        entry_price: null
+        entry_date: null
+        entry_support: null
+        target_price: null
+        stop_price: null
+
+    - symbol: 601318.SH
+      name: 中国平安
+      role: holding
+      main_shares: 500
+      economic_basis: 31239.32
+      sector: insurance_financial_group
+      satellite_limit: 100
+      main_adjustment_shares: 400
+      migration:
+        enabled: true
+        initial_ceiling_weight: 0.15061695
+        risk_principal_ceiling: 31239.32
+      peers: [601628.SH, 601601.SH, 601336.SH, 601319.SH, 000001.SZ]
+      satellite:
+        active: false
+        shares: 0
+        entry_price: null
+        entry_date: null
+        entry_support: null
+        target_price: null
+        stop_price: null
+
+    # 观察标的示例：成交后须改为 role: holding，并填写 main_shares/economic_basis。
+    # - symbol: 600000.SH
+    #   name: 示例股票
+    #   role: watchlist
+    #   main_shares: 0
+    #   economic_basis: 0
+    #   sector: new_energy_vehicle  # 也支持 satellite_communications / semiconductor / optical_communications
+    #   satellite_limit: 100
+    #   main_adjustment_shares: 500
+    #   peers: [600001.SH, 600002.SH, 600003.SH]
+    #   satellite: {active: false, shares: 0}
