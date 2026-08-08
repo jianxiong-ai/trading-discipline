@@ -1,13 +1,13 @@
 {% extends "base.html" %}
 {% block content %}
-<section class="page-title"><p class="eyebrow">账户事实来源</p><h1>持仓与成交</h1><p>只录入已经成交的事实；系统会同步现金、持仓与经济投入。费用未知时可先填0，后续用更正交易补记。</p></section>
+<section class="page-bar"><h1>持仓与成交</h1><span class="muted">只录入已成交事实</span></section>
 <section class="grid-two wide-left">
   <article class="panel"><div class="section-head"><h2>正式持仓</h2><span>现金 ¥{{ '%.2f'|format(cash) }}</span></div>
   <div class="table-wrap"><table><thead><tr><th>标的</th><th>主仓</th><th>卫星仓</th><th>经济投入</th><th>卫星计划</th></tr></thead><tbody>
   {% for p in holdings %}<tr><td><b>{{ p.name }}</b><br><small>{{ p.symbol }}</small></td><td>{{ p.main_shares }}股</td><td>{% if p.satellite.active %}{{ p.satellite.shares }}股{% else %}—{% endif %}</td><td>¥{{ '%.2f'|format(p.economic_basis) }}</td><td>{% if p.satellite.active %}<small>目标 {{ p.satellite.target_price }}<br>退出 {{ p.satellite.stop_price or '未设' }}</small>{% else %}<small>未启用</small>{% endif %}</td></tr>{% endfor %}
   </tbody></table></div>
   </article>
-  <aside class="panel form-panel"><h2>录入已成交交易</h2><form method="post" action="/trades" class="form-grid">
+  <aside class="panel form-panel"><h2>录入成交</h2><form method="post" action="/trades" class="form-grid">
     <label>标的<select name="symbol" required>{% for p in holdings %}<option value="{{ p.symbol }}">{{ p.name }}（{{ p.symbol }}）</option>{% endfor %}</select></label>
     <label>仓位<select name="bucket"><option value="main">主仓</option><option value="satellite">卫星仓</option></select></label>
     <label>方向<select name="side"><option value="buy">买入</option><option value="sell">卖出</option></select></label>
@@ -17,7 +17,7 @@
     <label>费用<input type="number" name="fee" min="0" step="0.01" value="0"></label>
     <label class="full">备注<input name="note" placeholder="例如：按14:15纪律减仓"></label>
     <details class="full"><summary>卫星仓首次买入时填写</summary><div class="form-grid compact"><label>支撑价<input name="entry_support" type="number" step="0.01"></label><label>目标价<input name="target_price" type="number" step="0.01"></label><label>风险退出价<input name="stop_price" type="number" step="0.01"></label></div></details>
-    <button class="full" type="submit">确认并记录成交</button>
+    <button class="full" type="submit">记录成交</button>
   </form></aside>
 </section>
 <section class="grid-two">
