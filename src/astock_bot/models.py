@@ -62,8 +62,12 @@ class Position:
     migration: dict[str, Any] = field(default_factory=dict)
     role: str = "holding"
     watchlist_entry_date: date | None = None
-    # 现金分红等公司事件：股权登记日禁常规减仓；除息日后未调账时用于有效成本校正。
+    # 现金分红等公司事件：股权登记日只延后普通迁移减仓/常规卫星止盈；
+    # 有效破位、确认顶部与硬风险仍优先；除息日后未调账时用于有效成本校正。
     corporate_events: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+    # 本轮完整交易周期的风险本金。它与 economic_basis（累计净经济投入）
+    # 分离：卖出、分红会改变后者，但不得把已发生风险从硬上限分母中抹掉。
+    risk_principal: float | None = None
 
     @property
     def total_shares(self) -> int:
@@ -92,6 +96,8 @@ class EquityEvidence:
     announcement_status: str
     announcement_risk: str
     summary: str
+    industry_strength: int = 0
+    industry_is_macro_proxy: bool = False
     company_status: str = "missing"
     company_direction: int | None = None
     items: tuple[EvidenceItem, ...] = ()
@@ -141,7 +147,7 @@ class EquityEvidence:
 
     @property
     def add_ready(self) -> bool:
-        return (
+        base_ready = (
             self.industry_status == "fresh"
             and self.industry_direction is not None
             and self.industry_direction > 0
@@ -149,6 +155,16 @@ class EquityEvidence:
             and self.announcement_status in {"fresh", "not_applicable"}
             and self.announcement_risk == "none"
         )
+        if not base_ready:
+            return False
+        # A broad macro proxy (for example the yield curve) can improve the
+        # backdrop but cannot, by itself, justify a company-level addition.
+        if self.industry_is_macro_proxy and self.industry_strength < 2:
+            return bool(
+                (self.company_direction is not None and self.company_direction > 0)
+                or self.corporate_action_confirmation
+            )
+        return True
 
     @property
     def satellite_entry_ready(self) -> bool:

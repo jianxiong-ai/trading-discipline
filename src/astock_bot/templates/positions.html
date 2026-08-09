@@ -1,14 +1,14 @@
 {% extends "base.html" %}
 {% block content %}
-<section class="page-bar"><h1>持仓与成交</h1><span class="muted">只录入已成交事实</span></section>
-<section class="grid-two wide-left">
-  <article class="panel"><div class="section-head"><h2>正式持仓</h2><span>现金 ¥{{ '%.2f'|format(cash) }}</span></div>
+<section class="page-title"><div><p class="eyebrow">POSITIONS</p><h1>持仓与成交</h1><p>系统只在你确认成交后更新仓位。</p></div><div class="cash"><span>可用资金</span><strong>¥{{ '{:,.2f}'.format(cash) }}</strong></div></section>
+<section class="layout-main positions-layout">
+  <article class="panel"><div class="section-head"><div><p class="eyebrow">CURRENT</p><h2>正式持仓</h2></div></div>
   <div class="table-wrap"><table><thead><tr><th>标的</th><th>主仓</th><th>卫星仓</th><th>经济投入</th><th>卫星计划</th></tr></thead><tbody>
   {% for p in holdings %}<tr><td><b>{{ p.name }}</b><br><small>{{ p.symbol }}</small></td><td>{{ p.main_shares }}股</td><td>{% if p.satellite.active %}{{ p.satellite.shares }}股{% else %}—{% endif %}</td><td>¥{{ '%.2f'|format(p.economic_basis) }}</td><td>{% if p.satellite.active %}<small>目标 {{ p.satellite.target_price }}<br>退出 {{ p.satellite.stop_price or '未设' }}</small>{% else %}<small>未启用</small>{% endif %}</td></tr>{% endfor %}
   </tbody></table></div>
   </article>
-  <aside class="panel form-panel"><h2>录入成交</h2><form method="post" action="/trades" class="form-grid">
-    <label>标的<select name="symbol" required>{% for p in holdings %}<option value="{{ p.symbol }}">{{ p.name }}（{{ p.symbol }}）</option>{% endfor %}</select></label>
+<aside class="panel form-panel sticky"><p class="eyebrow">CONFIRM</p><h2>录入已成交</h2><form method="post" action="/trades" class="form-grid"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>标的<select name="symbol" required>{% for p in positions %}<option value="{{ p.symbol }}">{{ p.name }}（{{ '观察仓首次买入' if p.role == 'watchlist' else '持仓' }}）</option>{% endfor %}</select></label>
     <label>仓位<select name="bucket"><option value="main">主仓</option><option value="satellite">卫星仓</option></select></label>
     <label>方向<select name="side"><option value="buy">买入</option><option value="sell">卖出</option></select></label>
     <label>成交日期<input type="date" name="executed_at" value="{{ today }}" required></label>
@@ -17,11 +17,11 @@
     <label>费用<input type="number" name="fee" min="0" step="0.01" value="0"></label>
     <label class="full">备注<input name="note" placeholder="例如：按14:15纪律减仓"></label>
     <details class="full"><summary>卫星仓首次买入时填写</summary><div class="form-grid compact"><label>支撑价<input name="entry_support" type="number" step="0.01"></label><label>目标价<input name="target_price" type="number" step="0.01"></label><label>风险退出价<input name="stop_price" type="number" step="0.01"></label></div></details>
-    <button class="full" type="submit">记录成交</button>
+    <button class="full" type="submit">确认并更新台账</button>
   </form></aside>
 </section>
-<section class="grid-two">
-  <article class="panel form-panel"><h2>登记分红到账</h2><form method="post" action="/dividends" class="form-grid compact"><label>标的<select name="symbol">{% for p in holdings %}<option value="{{ p.symbol }}">{{ p.name }}</option>{% endfor %}</select></label><label>到账日期<input type="date" name="executed_at" value="{{ today }}"></label><label>税后到账金额<input type="number" name="amount" min="0.01" step="0.01" required></label><label>备注<input name="note" placeholder="可填分红年度"></label><button class="full" type="submit">登记到账</button></form></article>
-  <article class="panel"><div class="section-head"><h2>最近成交流水</h2><span>按录入顺序保留</span></div><div class="table-wrap"><table><thead><tr><th>日期</th><th>标的</th><th>事项</th><th>股数/金额</th><th>现金变化</th></tr></thead><tbody>{% for t in transactions[:12] %}<tr><td>{{ t.executed_at }}</td><td>{{ t.symbol }}</td><td>{{ '分红' if t.side == 'dividend' else ('卫星仓' if t.bucket == 'satellite' else '主仓') ~ ('买入' if t.side == 'buy' else '卖出') }}</td><td>{% if t.side == 'dividend' %}¥{{ '%.2f'|format(t.cash_delta) }}{% else %}{{ t.shares }}股 @ {{ '%.2f'|format(t.price) }}{% endif %}</td><td class="{{ 'positive' if t.cash_delta > 0 else 'negative' }}">{{ '%+.2f'|format(t.cash_delta) }}</td></tr>{% else %}<tr><td colspan="5">尚无通过页面记录的成交。</td></tr>{% endfor %}</tbody></table></div></article>
+<section class="grid-two lower-grid">
+  <article class="panel form-panel"><h2>登记分红到账</h2><form method="post" action="/dividends" class="form-grid compact"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label>对应公告<select name="event_id" required>{% for event in dividend_events %}<option value="{{ event.event_id }}">{{ event.name }}｜{{ event.ex_date }}｜每股 {{ event.cash_per_share }}</option>{% else %}<option value="">请先在配置中登记分红公告</option>{% endfor %}</select></label><label>到账日期<input type="date" name="executed_at" value="{{ today }}"></label><label>税后到账金额<input type="number" name="amount" min="0.01" step="0.01" required></label><label>备注<input name="note" placeholder="可填分红年度"></label><button class="full" type="submit">登记到账</button></form></article>
+  <article class="panel"><div class="section-head"><h2>最近流水</h2><span>追加式纠错</span></div><div class="table-wrap"><table><thead><tr><th>日期</th><th>标的</th><th>事项</th><th>股数/金额</th><th>现金变化</th><th></th></tr></thead><tbody>{% for t in transactions[:12] %}<tr><td>{{ t.executed_at }}</td><td>{{ t.symbol }}</td><td>{{ '冲销' if t.side == 'reversal' else ('分红' if t.side == 'dividend' else ('分红调账校准' if t.side == 'basis_correction' else ('卫星仓' if t.bucket == 'satellite' else '主仓') ~ ('买入' if t.side == 'buy' else '卖出'))) }}</td><td>{% if t.side == 'dividend' %}¥{{ '%.2f'|format(t.cash_delta) }}{% else %}{{ t.shares }}股 {% if t.price %}@ {{ '%.2f'|format(t.price) }}{% endif %}{% endif %}</td><td class="{{ 'positive' if t.cash_delta > 0 else 'negative' }}">{{ '%+.2f'|format(t.cash_delta) }}</td><td>{% if t.side not in ['reversal', 'basis_correction'] and not t.reversal_of %}<form method="post" action="/transactions/{{ t.id }}/reverse"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="quiet danger" type="submit">冲销</button></form>{% endif %}</td></tr>{% else %}<tr><td colspan="6">尚无通过页面记录的成交。</td></tr>{% endfor %}</tbody></table></div></article>
 </section>
 {% endblock %}

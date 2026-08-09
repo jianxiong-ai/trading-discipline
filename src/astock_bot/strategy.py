@@ -9,10 +9,9 @@ from .models import EquityEvidence, Position, Quote, Signal, Technicals
 
 LOT_SIZE = 100
 
-# 股权登记日禁止的常规减仓；硬风险与卫星止损/到期仍允许。
+# 股权登记日仅阻止普通迁移减仓/卫星止盈；有效破位、阶段顶部、硬风险
+# 和卫星止损/到期退出均优先。缺失证据不构成“弱势”本身。
 _RECORD_DATE_BLOCKED_CODES = {
-    "DOWN_BREAK",
-    "STAGE_TOP_EXIT",
     "MIGRATION_TRIM",
     "SAT_SELL",
 }
@@ -178,7 +177,7 @@ def evaluate_position(
         liquidity_rules=liquidity_rules,
     )
     if strategic and strategic.code in {"DOWN_BREAK", "STAGE_TOP_EXIT", "MIGRATION_TRIM"}:
-        if _is_record_date(position, today):
+        if strategic.code == "MIGRATION_TRIM" and _is_record_date(position, today):
             _check(
                 diagnostics,
                 "corporate_event",
@@ -187,6 +186,7 @@ def evaluate_position(
                 strategic.code,
                 "股权登记日保留分红权，不发送常规减仓",
             )
+            return []
         else:
             return [strategic]
 
@@ -195,7 +195,13 @@ def evaluate_position(
             position, quote, tech, peer_change, today, rules, holidays, evidence, stage,
             technical_data_fresh=True,
         )
-        if satellite and satellite.code in _RECORD_DATE_BLOCKED_CODES and _is_record_date(position, today):
+        satellite_top_confirmed = bool((satellite.details or {}).get("top_confirmed")) if satellite else False
+        if (
+            satellite
+            and satellite.code in _RECORD_DATE_BLOCKED_CODES
+            and _is_record_date(position, today)
+            and not satellite_top_confirmed
+        ):
             _check(
                 diagnostics,
                 "corporate_event",
@@ -420,6 +426,7 @@ def _watchlist_entry_signal(
             position, position_sizing, "watchlist_entry_risk_weight", 0.0035
         ),
         1.0,
+        today=today,
     )
     planned_shares, planned_weight = _planned_watchlist_entry_shares(
         position, quote.price, portfolio_value, position_sizing
@@ -744,6 +751,7 @@ def _strategic_signal(
         _sizing_value(position, position_sizing, "entry_risk_weight", 0.005),
         float(strategic_rules.get("max_remaining_risk_capacity_fraction", 0.10)),
         _migration_risk_principal(migration_context),
+        today,
     )
     planned_shares, planned_weight = _planned_main_entry_shares(
         position,
@@ -901,6 +909,7 @@ def _bottom_reentry_signal(
         _sizing_value(position, position_sizing, "entry_risk_weight", 0.005),
         float(strategic_rules.get("max_remaining_risk_capacity_fraction", 0.10)),
         _migration_risk_principal(migration_context),
+        today,
     )
     planned_shares, planned_weight = _planned_main_entry_shares(
         position,
@@ -1011,6 +1020,13 @@ def _stage_top_signal(position, quote, tech, today, stage, stage_rules, evidence
         stage_rules.get("full_exit_enabled", True)
         and stage.get("full_exit_ready")
     )
+    # A completed top trim starts a new management rung.  Do not keep
+    # trimming the same distribution merely because the 45-day context is
+    # still remembered: a normal trim must first be re-armed by a new high.
+    # A full-exit signal remains available because it represents a materially
+    # worse state (trend damage plus thesis/broad-market confirmation).
+    if not full_exit and not stage.get("top_trim_rearmed", True):
+        return None
     if full_exit:
         shares = position.main_shares
         action = "阶段顶部确认，清理本轮主仓"
@@ -1081,6 +1097,13 @@ def _stage_top_signal(position, quote, tech, today, stage, stage_rules, evidence
             "capital_flow_signal": evidence.capital_flow_signal if evidence else "missing",
             "shareholder_signal": evidence.shareholder_signal if evidence else "missing",
             "event_rank": event_rank,
+            # Persist an instruction as pending; the service advances the
+            # trim rung only after an actual recorded sell reduces holdings.
+            "position_main_shares": position.main_shares,
+            "tracked_peak": stage.get("tracked_peak"),
+            "full_exit": full_exit,
+            "top_trim_stage": int(stage.get("top_trim_stage", 0) or 0) + 1,
+            "top_trim_rearmed": bool(stage.get("top_trim_rearmed", True)),
         },
     )
 
@@ -1125,17 +1148,34 @@ def _migration_rebound_trim_signal(
         tech.volume_ratio is not None
         and tech.volume_ratio >= float(migration_context.get("rebound_trim_volume_ratio", 1.0))
     )
-    external_available = bool(
-        peer_change is not None and market_change is not None and evidence is not None
+    external_available = bool(peer_change is not None and market_change is not None)
+    # Missing industry/company evidence is neutral. Only explicit fresh weak
+    # evidence may support the “external not strong” leg of a trim.
+    explicit_weak_evidence = bool(
+        evidence
+        and (
+            (
+                evidence.industry_status == "fresh"
+                and evidence.industry_direction is not None
+                and evidence.industry_direction <= 0
+            )
+            or (
+                evidence.company_status == "fresh"
+                and evidence.company_direction is not None
+                and evidence.company_direction < 0
+            )
+            or (
+                evidence.announcement_status == "fresh"
+                and evidence.announcement_risk in {"caution", "critical"}
+            )
+        )
     )
     external_not_strong = bool(
         external_available
         and (
             peer_change <= 0
             or market_change <= 0
-            or evidence.industry_direction is None
-            or evidence.industry_direction <= 0
-            or evidence.announcement_risk in {"caution", "critical"}
+            or explicit_weak_evidence
         )
     )
     trim_weight = float(migration_context.get("rebound_trim_weight", 0.03))
@@ -1288,6 +1328,7 @@ def _satellite_entry(
         _sizing_value(position, position_sizing, "entry_risk_weight", 0.005),
         float(rules.get("max_remaining_risk_capacity_fraction", 0.10)),
         _migration_risk_principal(migration_context),
+        today,
     )
     planned_shares, planned_weight = _planned_satellite_entry_shares(
         position,
@@ -1478,6 +1519,7 @@ def _active_satellite(
             "stop": round(stop, 2),
             "evidence": _evidence_note(evidence),
             "stage": stage["label"],
+            "top_confirmed": bool(stage.get("top_confirmed")),
             "event_rank": 2 if code == "SAT_EXIT" else 1,
             "technical_data_fresh": bool(technical_data_fresh),
         },
@@ -1499,7 +1541,12 @@ def _risk_signals(
     migration_context,
     technical_data_fresh=True,
 ):
-    if position.economic_basis <= 0 or position.total_shares <= 0:
+    if (
+        _effective_risk_principal(
+            position, _migration_risk_principal(migration_context)
+        ) <= 0
+        or position.total_shares <= 0
+    ):
         return []
     loss_ratio = _loss_ratio(
         position,
@@ -1642,12 +1689,14 @@ def _stage_assessment(
         and external_not_weak
         and bottom_score >= int(rules.get("bottom_confirmation_score", 5))
     )
+    right_side_intact = bool(rsi_recovery and slope_flattening and intraday_recovery)
     # 证据暂不可达时，不把已确认磨底回退为候选；仅在证据明确转弱或结构破坏时降级。
     memory_state = str(memory.get("state") or "NEUTRAL")
     if (
         not bottom_confirmed
         and memory_state == "BOTTOM_CONFIRMED"
         and bottom_context
+        and right_side_intact
         and not _evidence_is_adverse(evidence)
         and peer_change is not None
         and market_change is not None
@@ -1741,6 +1790,14 @@ def _stage_assessment(
         and quote.price < tech.ma10
         and full_exit_external_ready
     )
+    top_trim_stage = int(memory.get("top_trim_stage", 0) or 0)
+    execution_peak = float(memory.get("top_execution_peak") or 0)
+    rearm_ratio = float(rules.get("top_rearm_new_high_ratio", 0.03))
+    top_trim_rearmed = bool(
+        top_trim_stage <= 0
+        or execution_peak <= 0
+        or stage_peak >= execution_peak * (1 + rearm_ratio)
+    )
     if top_confirmed:
         label = "STAGE_TOP_CONFIRMED"
     elif near_top:
@@ -1766,6 +1823,7 @@ def _stage_assessment(
         "bottom_context": bottom_context,
         "bottom_confirmed": bottom_confirmed,
         "bottom_score": bottom_score,
+        "right_side_intact": right_side_intact,
         "near_top": near_top,
         "top_context": top_context,
         "top_confirmed": top_confirmed,
@@ -1775,6 +1833,9 @@ def _stage_assessment(
         "tracked_peak": stage_peak,
         "memory_update": memory_update,
         "full_exit_ready": full_exit_ready,
+        "top_trim_stage": top_trim_stage,
+        "top_trim_rearmed": top_trim_rearmed,
+        "top_execution_peak": execution_peak or None,
         "company_thesis_break": company_thesis_break,
         "broad_external_weak": broad_external_weak,
         "range_position_60": range_position,
@@ -2069,16 +2130,18 @@ def _entry_risk_budget(
     nav_risk_ratio,
     remaining_fraction,
     risk_principal_ceiling=None,
+    today: date | None = None,
 ) -> float:
     if portfolio_value <= 0:
         return 0.0
     nav_budget = portfolio_value * nav_risk_ratio
-    if position.economic_basis <= 0 and position.total_shares <= 0:
+    if position.total_shares <= 0:
         return nav_budget
-    current_loss = max(position.economic_basis - position.total_shares * price, 0.0)
-    risk_principal = position.economic_basis
-    if risk_principal_ceiling is not None:
-        risk_principal = min(risk_principal, float(risk_principal_ceiling))
+    basis = _effective_economic_basis(position, today)
+    current_loss = max(basis - position.total_shares * price, 0.0)
+    risk_principal = _effective_risk_principal(position, risk_principal_ceiling)
+    if risk_principal <= 0:
+        return 0.0
     hard_capacity = risk_principal * float(risk.get("max_loss_ratio", 0.25))
     remaining_capacity = max(hard_capacity - current_loss, 0.0)
     return min(
@@ -2167,7 +2230,10 @@ def _strong_confirmation_count(peer_change, market_change, evidence, rules) -> i
     return sum((
         peer_change is not None and peer_change > float(rules.get("peer_strong_ratio", 0.002)),
         market_change is not None and market_change > float(rules.get("market_strong_ratio", 0.003)),
-        evidence is not None and evidence.industry_direction is not None and evidence.industry_direction > 0,
+        evidence is not None
+        and evidence.industry_direction is not None
+        and evidence.industry_direction > 0
+        and evidence.industry_strength >= 2,
         evidence is not None and evidence.company_direction is not None and evidence.company_direction > 0,
         # A verified corporate action is one confirmation at most. It never
         # replaces the technical/volume gates or the fresh industry gate.
@@ -2266,9 +2332,7 @@ def _loss_ratio(
     today: date | None = None,
 ) -> float:
     basis = _effective_economic_basis(position, today) if today is not None else position.economic_basis
-    risk_principal = basis
-    if risk_principal_ceiling is not None:
-        risk_principal = min(risk_principal, float(risk_principal_ceiling))
+    risk_principal = _effective_risk_principal(position, risk_principal_ceiling)
     if risk_principal <= 0:
         return 0.0
     economic_loss = basis - position.total_shares * price
@@ -2281,6 +2345,18 @@ def _migration_risk_principal(migration_context: dict[str, Any] | None) -> float
         return None
     value = migration_context.get("risk_principal_ceiling")
     return float(value) if value is not None else None
+
+
+def _effective_risk_principal(position: Position, ceiling: float | None = None) -> float:
+    """Return the immutable cycle risk denominator, never the residual basis.
+
+    Migration mode explicitly supplies the risk principal agreed at system entry;
+    subsequent sells and dividends must not shrink that denominator.
+    """
+    if ceiling is not None:
+        return float(ceiling)
+    value = position.risk_principal
+    return float(value) if value is not None else max(float(position.economic_basis), 0.0)
 
 
 def _is_record_date(position: Position, today: date) -> bool:
@@ -2320,7 +2396,7 @@ def _unapplied_dividend_cash(position: Position, today: date) -> float:
 def _effective_economic_basis(position: Position, today: date | None = None) -> float:
     if today is None:
         return position.economic_basis
-    return max(position.economic_basis - _unapplied_dividend_cash(position, today), 0.0)
+    return position.economic_basis - _unapplied_dividend_cash(position, today)
 
 
 def _evidence_is_adverse(evidence: EquityEvidence | None) -> bool:
@@ -2342,6 +2418,19 @@ def _build_stage_memory_update(
     today_iso = quote.timestamp.date().isoformat()
     now_iso = quote.timestamp.isoformat()
     bottom_started = str(memory.get("bottom_started_at") or "")
+    top_execution = {
+        "top_trim_stage": int(memory.get("top_trim_stage", 0) or 0),
+        "top_executed_shares": int(memory.get("top_executed_shares", 0) or 0),
+        "top_last_execution_date": memory.get("top_last_execution_date"),
+        "top_last_execution_price": memory.get("top_last_execution_price"),
+        "top_execution_peak": memory.get("top_execution_peak"),
+        "top_pending_anchor_shares": memory.get("top_pending_anchor_shares"),
+        "top_pending_shares": int(memory.get("top_pending_shares", 0) or 0),
+        "top_pending_event_id": memory.get("top_pending_event_id"),
+        "top_pending_price": memory.get("top_pending_price"),
+        "top_pending_peak": memory.get("top_pending_peak"),
+        "top_pending_full_exit": bool(memory.get("top_pending_full_exit", False)),
+    }
 
     if label in {"NEAR_STAGE_TOP", "STAGE_TOP_CONFIRMED"}:
         started_at = (
@@ -2355,6 +2444,7 @@ def _build_stage_memory_update(
             "peak_price": round(stage_peak, 4),
             "bottom_started_at": bottom_started or None,
             "last_updated": now_iso,
+            **top_execution,
         }
 
     # 显式退出顶部跟踪窗口后才清峰；日常 NEUTRAL/BOTTOM 不得覆盖仍有效的顶部记忆。
@@ -2365,6 +2455,17 @@ def _build_stage_memory_update(
             "peak_price": 0.0,
             "bottom_started_at": None,
             "last_updated": now_iso,
+            "top_trim_stage": 0,
+            "top_executed_shares": 0,
+            "top_last_execution_date": None,
+            "top_last_execution_price": None,
+            "top_execution_peak": None,
+            "top_pending_anchor_shares": None,
+            "top_pending_shares": 0,
+            "top_pending_event_id": None,
+            "top_pending_price": None,
+            "top_pending_peak": None,
+            "top_pending_full_exit": False,
         }
     if memory_state in {"NEAR_STAGE_TOP", "STAGE_TOP_CONFIRMED"} and remembered_top:
         # remembered_top 为真时 label 至少为 NEAR_STAGE_TOP；此处仅防御异常路径。
@@ -2374,6 +2475,7 @@ def _build_stage_memory_update(
             "peak_price": round(max(float(memory.get("peak_price") or 0), stage_peak), 4),
             "bottom_started_at": bottom_started or None,
             "last_updated": now_iso,
+            **top_execution,
         }
 
     if label in {"BOTTOMING", "BOTTOM_CONFIRMED"}:
@@ -2387,6 +2489,7 @@ def _build_stage_memory_update(
             "peak_price": 0.0,
             "bottom_started_at": started_at,
             "last_updated": now_iso,
+            **top_execution,
         }
 
     return {
@@ -2395,6 +2498,7 @@ def _build_stage_memory_update(
         "peak_price": 0.0,
         "bottom_started_at": None,
         "last_updated": now_iso,
+        **top_execution,
     }
 
 

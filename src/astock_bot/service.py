@@ -18,6 +18,164 @@ from .strategy import evaluate_position, overheat_watch_signal
 
 
 class MonitorService:
+    _PERSISTENT_REDUCTION_CODES = {
+        "EMERGENCY_RISK", "DOWN_BREAK", "STAGE_TOP_EXIT", "MIGRATION_TRIM",
+        "SAT_EXIT", "SAT_SELL",
+    }
+
+    @classmethod
+    def _semantic_event_key(cls, signal: Signal) -> str:
+        """Keep an unchanged reduction signal from repeating on every date."""
+        if signal.code in cls._PERSISTENT_REDUCTION_CODES:
+            return signal.event_id.split("|", 1)[1] if "|" in signal.event_id else signal.event_id
+        return signal.event_id
+
+    def _trading_days_since(self, start: str | None, current) -> int:
+        if not start:
+            return 0
+        try:
+            cursor = current.fromisoformat(str(start))
+        except (TypeError, ValueError):
+            return 0
+        if cursor >= current:
+            return 0
+        days = 0
+        while cursor < current:
+            cursor = cursor.fromordinal(cursor.toordinal() + 1)
+            if cursor.weekday() < 5 and cursor.isoformat() not in self.config.holidays:
+                days += 1
+        return days
+
+    def _pending_reduction_reminder_due(
+        self, signal: Signal, now: datetime, sent_rank: int | None
+    ) -> bool:
+        if signal.code not in self._PERSISTENT_REDUCTION_CODES or sent_rank is None:
+            return False
+        active = self.state.active_signal(signal.symbol)
+        semantic_key = self._semantic_event_key(signal)
+        active_key = str(active.get("semantic_key") or active.get("event_id", "")).split("|", 1)[-1]
+        if active_key != semantic_key or not active.get("last_notified_date"):
+            return False
+        settings = self.config.section("notification")
+        first_days = max(int(settings.get("pending_reduction_reminder_first_days", 1)), 1)
+        repeat_days = max(int(settings.get("pending_reduction_reminder_repeat_days", 2)), 1)
+        if signal.code == "EMERGENCY_RISK":
+            # 硬风险未处理时每天复提醒，不等待普通减仓的冷却周期。
+            repeat_days = 1
+        reminder_count = int(active.get("reminder_count", 0) or 0)
+        interval = first_days if reminder_count == 0 else repeat_days
+        elapsed = self._trading_days_since(active.get("last_notified_date"), now.date())
+        return elapsed >= interval
+
+    def _record_reduction_notification(self, signal: Signal, day) -> None:
+        if signal.code not in self._PERSISTENT_REDUCTION_CODES:
+            return
+        active = self.state.active_signal(signal.symbol)
+        if not active:
+            return
+        if str(active.get("semantic_key") or "") != self._semantic_event_key(signal):
+            return
+        active["last_notified_date"] = day.isoformat()
+        if signal.details.get("pending_reminder"):
+            active["reminder_count"] = int(active.get("reminder_count", 0) or 0) + 1
+        else:
+            active.setdefault("reminder_count", 0)
+        self.state.save_active_signal(signal.symbol, active)
+
+    def _sync_stage_execution(self, position, stage_memory: dict, today, allow_state_update: bool) -> dict:
+        """Confirm a notified top tranche only after the recorded holding shrinks.
+
+        A top signal is an instruction, not an execution. Keeping the planned
+        tranche pending until the user records a sell prevents the strategy
+        from silently advancing its top-management ladder.
+        """
+        memory = dict(stage_memory or {})
+        anchor = int(memory.get("top_pending_anchor_shares", 0) or 0)
+        if anchor <= position.main_shares:
+            return memory
+        executed = anchor - position.main_shares
+        if executed < 100:
+            return memory
+        memory.update({
+            "top_trim_stage": int(memory.get("top_trim_stage", 0) or 0) + 1,
+            "top_executed_shares": int(memory.get("top_executed_shares", 0) or 0) + executed,
+            "top_last_execution_date": today.isoformat(),
+            "top_last_execution_price": memory.get("top_pending_price"),
+            "top_execution_peak": memory.get("top_pending_peak"),
+            "top_pending_anchor_shares": None,
+            "top_pending_shares": 0,
+            "top_pending_event_id": None,
+            "top_pending_price": None,
+            "top_pending_peak": None,
+            "top_pending_full_exit": False,
+        })
+        if allow_state_update:
+            self.state.save_stage_state(position.symbol, memory)
+        return memory
+
+    def _record_stage_top_signal(self, signal: Signal) -> None:
+        """Store the notified top tranche as pending until a recorded trade confirms it."""
+        if signal.code != "STAGE_TOP_EXIT":
+            return
+        memory = self.state.stage_state(signal.symbol)
+        pending_event = memory.get("top_pending_event_id")
+        if pending_event == signal.event_id:
+            return
+        memory.update({
+            "top_pending_anchor_shares": int(signal.details.get("position_main_shares", 0) or 0),
+            "top_pending_shares": int(signal.shares or 0),
+            "top_pending_event_id": signal.event_id,
+            "top_pending_price": signal.price,
+            "top_pending_peak": signal.details.get("tracked_peak"),
+            "top_pending_full_exit": bool(signal.details.get("full_exit")),
+        })
+        self.state.save_stage_state(signal.symbol, memory)
+
+    def _sync_reduction_lifecycle(
+        self,
+        position,
+        signals: list[Signal],
+        technical_fresh: bool,
+        allow_state_update: bool,
+    ) -> None:
+        """Persist an active reduction and clear its dedupe when it resolves.
+
+        This is deliberately gated by fresh technical data. A stale/missing
+        quote must not clear a live reduction and make it eligible for a
+        duplicate alert on the next trading day.
+        """
+        if not allow_state_update or not technical_fresh:
+            return
+        active = self.state.active_signal(position.symbol)
+        candidates = [
+            signal for signal in signals
+            if signal.code in self._PERSISTENT_REDUCTION_CODES
+        ]
+        if candidates:
+            current = min(candidates, key=self._signal_priority)
+            semantic_key = self._semantic_event_key(current)
+            old_key = str(active.get("semantic_key") or active.get("event_id", "")).split("|", 1)[-1]
+            if old_key and old_key != semantic_key and active.get("code") in self._PERSISTENT_REDUCTION_CODES:
+                self.state.clear_sent_semantic_key(old_key)
+            same_signal = bool(old_key and old_key == semantic_key and active.get("code") == current.code)
+            self.state.save_active_signal(position.symbol, {
+                "code": current.code,
+                "event_id": current.event_id,
+                "semantic_key": semantic_key,
+                "date": current.details.get("signal_date") or current.event_id.split("|", 1)[0],
+                "first_seen_date": active.get("first_seen_date") if same_signal else current.event_id.split("|", 1)[0],
+                "last_notified_date": active.get("last_notified_date") if same_signal else None,
+                "reminder_count": int(active.get("reminder_count", 0) or 0) if same_signal else 0,
+                "key_level": current.key_level,
+                "position_main_shares": int(current.details.get("position_main_shares", position.main_shares) or position.main_shares),
+            })
+            return
+        if active.get("code") in self._PERSISTENT_REDUCTION_CODES:
+            old_key = str(active.get("semantic_key") or active.get("event_id", "")).split("|", 1)[-1]
+            if old_key:
+                self.state.clear_sent_semantic_key(old_key)
+            self.state.clear_active_signal(position.symbol)
+
     def __init__(self, config: AppConfig):
         self.config = config
         ds = config.section("data_source")
@@ -204,6 +362,12 @@ class MonitorService:
                     migration_group_caps,
                 )
                 diagnostics: dict = {}
+                stage_memory = self._sync_stage_execution(
+                    position,
+                    self.state.stage_state(position.symbol),
+                    now.date(),
+                    allow_state_update=not dry_run,
+                )
                 found = evaluate_position(
                     position, quote, tech, node, peer_change, market_change, now.date(),
                     self.config.section("satellite_rules"), self.config.section("risk"), self.config.holidays,
@@ -220,7 +384,7 @@ class MonitorService:
                     self.config.section("position_sizing"),
                     migration_contexts.get(position.symbol, {}),
                     technical_fresh,
-                    self.state.stage_state(position.symbol),
+                    stage_memory,
                     self.config.section("watchlist_rules"),
                     self.config.section("execution_constraints"),
                     self.config.section("liquidity"),
@@ -257,10 +421,16 @@ class MonitorService:
                     )
                     if reminder:
                         found = [*found, reminder]
-                if execution_type == "scheduled" and technical_fresh:
+                # A late recovery is still an official node result. Persisting
+                # its stage snapshot prevents missed top/bottom transitions
+                # when a container wakes after the normal node window.
+                if execution_type in {"scheduled", "scheduled_recovery"} and technical_fresh:
                     memory_update = diagnostics.get("stage", {}).get("memory_update")
                     if memory_update:
                         self.state.save_stage_state(position.symbol, memory_update)
+                self._sync_reduction_lifecycle(
+                    position, found, technical_fresh, allow_state_update=not dry_run
+                )
                 for signal in found:
                     signal.details["change_pct"] = quote.change_ratio * 100
                 signals.extend(found)
@@ -398,18 +568,11 @@ class MonitorService:
                     now.date(),
                     signal.category,
                     int(signal.details.get("event_rank", 1) or 1),
+                    semantic_key=self._semantic_event_key(signal),
                 )
-                if signal.code == "DOWN_BREAK":
-                    self.state.save_active_signal(signal.symbol, {
-                        "code": signal.code,
-                        "event_id": signal.event_id,
-                        "date": now.date().isoformat(),
-                        "key_level": signal.key_level,
-                        "position_main_shares": int(
-                            signal.details.get("position_main_shares", 0) or 0
-                        ),
-                    })
-                elif signal.code == "FALSE_BREAK":
+                self._record_reduction_notification(signal, now.date())
+                self._record_stage_top_signal(signal)
+                if signal.code == "FALSE_BREAK":
                     self.state.clear_active_signal(signal.symbol)
             self.state.mark_notification(
                 now.date(),
@@ -504,7 +667,7 @@ class MonitorService:
             if timestamp.date() != now.date():
                 continue
             execution_type = record.get("execution_type")
-            if execution_type == "scheduled":
+            if execution_type in {"scheduled", "scheduled_recovery"}:
                 explicit[node].append((timestamp, record))
                 continue
             if execution_type is not None:
@@ -842,12 +1005,20 @@ class MonitorService:
         suppressed: list[dict] = []
         unique: list[Signal] = []
         for signal in sorted(signals, key=self._signal_priority):
-            sent_rank = self.state.sent_rank(signal.event_id)
+            semantic_key = self._semantic_event_key(signal)
+            sent_rank = (
+                self.state.sent_rank_for_semantic_key(semantic_key)
+                if signal.code in self._PERSISTENT_REDUCTION_CODES
+                else self.state.sent_rank(signal.event_id)
+            )
             current_rank = int(signal.details.get("event_rank", 1) or 1)
-            if sent_rank is not None and current_rank <= sent_rank:
+            reminder_due = self._pending_reduction_reminder_due(signal, now, sent_rank)
+            if sent_rank is not None and current_rank <= sent_rank and not reminder_due:
                 reason = "duplicate_event" if current_rank == sent_rank else "non_upgrade_event"
                 suppressed.append({"event_id": signal.event_id, "reason": reason})
                 continue
+            if reminder_due:
+                signal.details["pending_reminder"] = True
             unique.append(signal)
 
         result.extend(signal for signal in unique if signal.category == "risk")
@@ -891,10 +1062,6 @@ class MonitorService:
     ) -> Signal | None:
         active = self.state.active_signal(position.symbol)
         if active.get("code") != "DOWN_BREAK":
-            return None
-        if active.get("date") != today.isoformat():
-            if allow_state_update:
-                self.state.clear_active_signal(position.symbol)
             return None
         stored_shares = int(active.get("position_main_shares", 0) or 0)
         if stored_shares and stored_shares != position.main_shares:
@@ -1057,13 +1224,19 @@ class MonitorService:
         if portfolio_value <= 0:
             return None, None
         groups = self.config.section("risk").get("correlation_groups", {})
+        # Include zero-share watchlist candidates in membership resolution. Their
+        # current exposure is still zero, but they must inherit the same sector
+        # cap before a proposed first buy is sized. Filtering to holdings here
+        # previously returned (None, None) for a watchlist insurance/sector name,
+        # allowing its starter position to bypass the group ceiling.
         positions = {
             position.symbol: position
             for position in self.config.positions
-            if position.role == "holding" and position.symbol in quotes
+            if position.symbol in quotes
         }
+        matches: list[tuple[float, float, float, str]] = []
         for name, group in groups.items():
-            symbols = {str(item).upper() for item in group.get("symbols", [])}
+            symbols = self._correlation_group_symbols(group, positions)
             if symbol not in symbols:
                 continue
             value = sum(
@@ -1073,8 +1246,27 @@ class MonitorService:
             cap = float(group.get("max_ratio"))
             if migration_group_caps and name in migration_group_caps:
                 cap = float(migration_group_caps[name])
-            return value / portfolio_value, cap
+            weight = value / portfolio_value
+            matches.append((cap - weight, weight, cap, name))
+        if matches:
+            # A security can match several groups through overlapping explicit
+            # codes and sectors. Bind sizing to the smallest remaining room,
+            # not to the first YAML group encountered.
+            _, weight, cap, _ = min(matches, key=lambda item: item[0])
+            return weight, cap
         return None, None
+
+    @staticmethod
+    def _correlation_group_symbols(group: dict, positions: dict) -> set[str]:
+        """Combine explicit symbols with sector membership for dynamic watchlist names."""
+        symbols = {str(item).upper() for item in group.get("symbols", [])}
+        sectors = {str(item).strip().lower() for item in group.get("sectors", []) if str(item).strip()}
+        if sectors:
+            symbols.update(
+                symbol for symbol, position in positions.items()
+                if str(position.sector).strip().lower() in sectors
+            )
+        return symbols
 
     def _migration_contexts(
         self,
@@ -1171,11 +1363,7 @@ class MonitorService:
         group_configs = config.get("correlation_groups", {})
         for name, settings in group_configs.items():
             group = risk.get("correlation_groups", {}).get(name, {})
-            symbols = [
-                str(item).upper()
-                for item in group.get("symbols", [])
-                if str(item).upper() in positions
-            ]
+            symbols = sorted(self._correlation_group_symbols(group, positions) & set(positions))
             if not symbols:
                 continue
             configured_ceiling = float(settings["initial_ceiling_weight"])

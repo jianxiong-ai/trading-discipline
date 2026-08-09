@@ -104,6 +104,7 @@ def equity_evidence(
         announcement_status="fresh",
         announcement_risk=announcement_risk,
         summary="官方产业证据；公告门控通过",
+        industry_strength=2 if industry_direction > 0 else 0,
         company_status="fresh" if company_direction is not None else "missing",
         company_direction=company_direction,
         margin_status=margin_status,
@@ -584,6 +585,65 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(signals[0].shares, 100)
         self.assertTrue(diagnostics["checks"]["migration_trim"]["rebound_rejection"]["passed"])
 
+    def test_migration_trim_does_not_treat_missing_industry_as_weak(self):
+        rejected = tech(
+            support=39, resistance=42, vwap=42.0, volume_ratio=1.2,
+            close=41.7, previous=42.1, open_=42.05,
+        )
+        unavailable = EquityEvidence(
+            symbol="600362.SH",
+            industry_status="missing",
+            industry_direction=None,
+            announcement_status="missing",
+            announcement_risk="unknown",
+            summary="产业证据不可用",
+        )
+        diagnostics = {}
+        signals = evaluate_position(
+            position(), quote(41.8), rejected, "14:15", 0.01, 0.001,
+            date(2026, 7, 28), {}, {"max_loss_ratio": 0.99, "warning_ratio": 0.90},
+            set(), 100000, 0.35, 180000, None, None, {}, 0,
+            unavailable, {}, diagnostics, {},
+            {
+                "enabled": True,
+                "position_ceiling": 0.4285,
+                "long_term_target_weight": 0.20,
+                "rebound_trim_weight": 0.03,
+                "rebound_resistance_distance_ratio": 0.01,
+                "rebound_trim_volume_ratio": 1.0,
+            },
+        )
+        self.assertEqual(signals, [])
+
+    def test_record_date_still_blocks_routine_migration_trim(self):
+        rejected = tech(
+            support=39, resistance=42, vwap=42.0, volume_ratio=1.2,
+            close=41.7, previous=42.1, open_=42.05,
+        )
+        holder = Position(
+            "600362.SH", "江西铜业", 1800, 87720, "copper", 300, 300, (),
+            SatellitePosition(), corporate_events=({
+                "type": "cash_dividend", "record_date": "2026-07-28",
+                "ex_date": "2026-07-29", "cash_per_share": 0.50,
+            },),
+        )
+        diagnostics = {}
+        signals = evaluate_position(
+            holder, quote(41.8), rejected, "14:15", -0.01, 0.001,
+            date(2026, 7, 28), {}, {"max_loss_ratio": 0.99, "warning_ratio": 0.90},
+            set(), 100000, 0.35, 180000, None, None, {}, 0,
+            equity_evidence(0), {}, diagnostics, {},
+            {
+                "enabled": True,
+                "position_ceiling": 0.4285,
+                "long_term_target_weight": 0.20,
+                "rebound_trim_weight": 0.03,
+                "rebound_resistance_distance_ratio": 0.01,
+                "rebound_trim_volume_ratio": 1.0,
+            },
+        )
+        self.assertEqual(signals, [])
+
     def test_satellite_cannot_bypass_loss_warning_in_migration_mode(self):
         recovering = tech(
             support=37.8, resistance=40, vwap=37.9, volume_ratio=1.4,
@@ -614,6 +674,18 @@ class StrategyTests(unittest.TestCase):
         )
         self.assertGreater(uncapped, 0)
         self.assertEqual(capped, 0)
+
+    def test_migration_risk_principal_does_not_shrink_after_reduction(self):
+        reduced = Position(
+            "600362.SH", "江西铜业", 1600, 77820, "copper", 300, 300, (),
+            SatellitePosition(), risk_principal=87720,
+        )
+        from astock_bot.strategy import _loss_ratio
+
+        self.assertAlmostEqual(
+            _loss_ratio(reduced, 43, 87720),
+            (77820 - 1600 * 43) / 87720,
+        )
 
     def test_low_zone_without_right_side_confirmation_is_only_bottoming(self):
         bottom = tech(
@@ -806,7 +878,7 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(diagnostics["stage"]["memory_update"]["started_at"], "2026-07-28")
         self.assertAlmostEqual(diagnostics["stage"]["memory_update"]["peak_price"], 45.0)
 
-    def test_record_date_blocks_down_break_but_keeps_hard_risk(self):
+    def test_record_date_allows_effective_down_break_but_keeps_hard_risk_priority(self):
         weak = tech(
             support=39.5, resistance=42, vwap=39.4, volume_ratio=1.5,
             close=38.9, previous=39.8, open_=39.6,
@@ -832,12 +904,12 @@ class StrategyTests(unittest.TestCase):
             ),
         )
         signals = evaluate_position(
-            holder, Quote("601336.SH", "新华保险", datetime(2026, 8, 6, 10, 15, tzinfo=TZ), 60.5, 62.0, 61, 61, 60, 1, 1),
+            holder, Quote("601336.SH", "新华保险", datetime(2026, 8, 6, 10, 15, tzinfo=TZ), 39.0, 62.0, 61, 61, 38.9, 1, 1),
             weak, "10:15", -0.01, -0.005, date(2026, 8, 6),
             {}, {"max_loss_ratio": 0.99, "near_limit_ratio": 0.98, "warning_ratio": 0.90},
             set(), 100000, 0.20, 180000, None, None, {}, 0, equity_evidence(-1),
         )
-        self.assertEqual(signals, [])
+        self.assertEqual(signals[0].code, "DOWN_BREAK")
 
         hard = evaluate_position(
             holder, Quote("601336.SH", "新华保险", datetime(2026, 8, 6, 10, 15, tzinfo=TZ), 40.0, 62.0, 50, 50, 40, 1, 1),
@@ -897,6 +969,114 @@ class StrategyTests(unittest.TestCase):
         # 500 * 50% = 250 → 向下取整 200，而不是向上 300。
         self.assertEqual(signals[0].shares, 200)
         self.assertIn("区间位置", signals[0].reason)
+
+    def test_executed_top_trim_requires_new_high_to_rearm(self):
+        top = tech(
+            support=40, resistance=43, vwap=42.1, volume_ratio=1.2,
+            close=41.8, previous=42.2, open_=42.2,
+            atr14=1, rsi14=60, previous_rsi14=65, rsi_max_5=72,
+            range_position_60=0.65, recent_high_60=43, recent_low_60=35,
+        )
+        top.ma5 = 43
+        top.ma10 = 41
+        memory = {
+            "state": "STAGE_TOP_CONFIRMED",
+            "started_at": "2026-07-28",
+            "peak_price": 43.0,
+            "top_trim_stage": 1,
+            "top_execution_peak": 43.0,
+        }
+        diagnostics = {}
+        signals = evaluate_position(
+            position(main_shares=500), quote(42), top, "13:15", -0.01, 0.001,
+            date(2026, 7, 28), {}, {"max_loss_ratio": 0.99, "warning_ratio": 0.90},
+            set(), 100000, 0.20, 180000, None, None, {}, 0, equity_evidence(0),
+            {"full_exit_enabled": True, "top_rearm_new_high_ratio": 0.03}, diagnostics,
+            {}, {}, True, memory,
+        )
+        self.assertTrue(diagnostics["stage"]["top_confirmed"])
+        self.assertFalse(diagnostics["stage"]["top_trim_rearmed"])
+        self.assertEqual(signals, [])
+
+        rearmed = tech(
+            support=40, resistance=45, vwap=42.1, volume_ratio=1.2,
+            close=41.8, previous=42.2, open_=42.2,
+            atr14=1, rsi14=60, previous_rsi14=65, rsi_max_5=72,
+            range_position_60=0.65, recent_high_60=45, recent_low_60=35,
+        )
+        rearmed.ma5 = 43
+        rearmed.ma10 = 41
+        diagnostics = {}
+        signals = evaluate_position(
+            position(main_shares=500), quote(42), rearmed, "13:15", -0.01, 0.001,
+            date(2026, 7, 28), {}, {"max_loss_ratio": 0.99, "warning_ratio": 0.90},
+            set(), 100000, 0.20, 180000, None, None, {}, 0, equity_evidence(0),
+            {"full_exit_enabled": True, "top_rearm_new_high_ratio": 0.03}, diagnostics,
+            {}, {}, True, memory,
+        )
+        self.assertTrue(diagnostics["stage"]["top_trim_rearmed"])
+        self.assertEqual(signals[0].code, "STAGE_TOP_EXIT")
+
+    def test_stale_bottom_memory_cannot_support_entry_after_right_side_breaks(self):
+        broken = tech(
+            support=39.5, resistance=42, vwap=40.2, volume_ratio=1.2,
+            close=39.7, previous=40.1, open_=40.2,
+            atr14=0.5, rsi14=34, previous_rsi14=38, rsi_min_5=32,
+            range_position_60=0.20, recent_high_60=45, recent_low_60=35,
+            ma20_slope_5d=-0.02,
+        )
+        memory = {
+            "state": "BOTTOM_CONFIRMED",
+            "started_at": "2026-08-07",
+            "peak_price": 0.0,
+            "bottom_started_at": "2026-08-07",
+        }
+        unavailable = EquityEvidence(
+            symbol="600487.SH", industry_status="missing", industry_direction=None,
+            announcement_status="missing", announcement_risk="none",
+            summary="产业证据不可用",
+        )
+        diagnostics = {}
+        signals = evaluate_position(
+            Position(
+                "600487.SH", "亨通光电", 0, 0, "optical_communications", 100, 500, (),
+                SatellitePosition(), role="watchlist",
+            ),
+            Quote("600487.SH", "亨通光电", datetime(2026, 8, 8, 14, 15, tzinfo=TZ), 39.7, 40.1, 40.2, 40.2, 39.5, 1, 1),
+            broken, "14:15", 0.0, 0.0, date(2026, 8, 8),
+            {}, {"max_loss_ratio": 0.99, "warning_ratio": 0.90}, set(),
+            100000, 0.0, 180000, None, None, {}, 0, unavailable,
+            {}, diagnostics, {}, {}, True, memory,
+            {"allowed_nodes": ["10:15", "13:15", "14:15"]},
+        )
+        self.assertFalse(diagnostics["stage"]["right_side_intact"])
+        self.assertFalse(diagnostics["stage"]["bottom_confirmed"])
+        self.assertEqual(diagnostics["stage"]["label"], "BOTTOMING")
+        self.assertEqual(signals, [])
+
+    def test_record_date_does_not_block_confirmed_stage_top_exit(self):
+        top = tech(
+            support=40, resistance=43, vwap=42.1, volume_ratio=1.2,
+            close=41.8, previous=42.2, open_=42.2,
+            atr14=1, rsi14=60, previous_rsi14=65, rsi_max_5=72,
+            range_position_60=0.65, recent_high_60=43, recent_low_60=35,
+        )
+        top.ma5 = 43
+        top.ma10 = 41
+        holder = Position(
+            "600362.SH", "江西铜业", 500, 20000, "copper", 100, 300, (),
+            SatellitePosition(), corporate_events=({
+                "type": "cash_dividend", "record_date": "2026-07-28",
+                "ex_date": "2026-07-29", "cash_per_share": 0.50,
+            },),
+        )
+        signals = evaluate_position(
+            holder, quote(42), top, "13:15", -0.01, 0.001,
+            date(2026, 7, 28), {}, {"max_loss_ratio": 0.99, "warning_ratio": 0.90},
+            set(), 100000, 0.20, 180000, None, None, {}, 0,
+            equity_evidence(0), {"full_exit_enabled": True}, {},
+        )
+        self.assertEqual(signals[0].code, "STAGE_TOP_EXIT")
 
     def test_bottom_confirmed_does_not_regress_when_evidence_unavailable(self):
         bottom = tech(

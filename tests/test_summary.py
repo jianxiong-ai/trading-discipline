@@ -34,6 +34,16 @@ class DailySummaryTests(unittest.TestCase):
             self.assertEqual([record["node"] for record in selected], ["09:15", "10:15", "13:15"])
             self.assertEqual(selected[1]["timestamp"], "2026-07-29T10:15:12+08:00")
 
+    def test_scheduled_recovery_is_included_in_daily_summary_records(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            log_file = root / "events.jsonl"
+            record = self._record("2026-07-29T10:18:00+08:00", "10:15", "scheduled_recovery")
+            log_file.write_text(json.dumps(record, ensure_ascii=False) + "\n", encoding="utf-8")
+            service = MonitorService(self._config(root))
+            selected = service._formal_records_for_day(datetime(2026, 7, 29, 15, 30, tzinfo=TZ))
+            self.assertEqual([item["node"] for item in selected], ["10:15"])
+
     def test_summary_reason_distinguishes_near_top_from_confirmed_top(self):
         near = MonitorService._summary_reason({
             "status": "NO_ALERT", "price": 44, "support": 41, "resistance": 45,

@@ -4,22 +4,24 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{{ title }}</title>
-    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="stylesheet" href="/static/styles.css?v={{ asset_version }}">
   </head>
   <body>
     <header class="site-header">
-      <a class="brand" href="/">持仓纪律</a>
-      <nav>
-        <a href="/">组合看板</a>
-        <a href="/positions">持仓与成交</a>
-        <a href="/watchlist">观察仓与复盘</a>
-      </nav>
+      <div class="header-inner">
+        <a class="brand" href="/"><i></i><span>持仓纪律</span></a>
+        <nav>
+          <a class="{{ 'active' if request.url.path == '/' else '' }}" href="/">看板</a>
+          <a class="{{ 'active' if request.url.path == '/positions' else '' }}" href="/positions">持仓</a>
+          <a class="{{ 'active' if request.url.path == '/watchlist' else '' }}" href="/watchlist">股票池</a>
+        </nav>
+      </div>
     </header>
     <main class="page">
       {% if notice %}<div class="flash success">{{ notice }}</div>{% endif %}
       {% if error %}<div class="flash error">{{ error }}</div>{% endif %}
       {% block content %}{% endblock %}
     </main>
-    <footer>仅记录已成交事实；不自动下单。</footer>
+    <footer>只做研究与纪律提醒，不连接券商，不自动下单。</footer>
   </body>
 </html>

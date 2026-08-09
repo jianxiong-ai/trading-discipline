@@ -80,6 +80,74 @@ class ServicePolicyTests(unittest.TestCase):
             self.assertEqual([item.code for item in sendable], ["EMERGENCY_RISK"])
             self.assertEqual(suppressed, [])
 
+    def test_unchanged_reduction_gets_next_day_pending_reminder(self):
+        with TemporaryDirectory() as directory:
+            service = MonitorService(self._config(Path(directory)))
+            first = signal("600362.SH", "MIGRATION_TRIM", "strategy")
+            first.event_id = "2026-07-30|600362.SH:MIGRATION_TRIM:42.00"
+            first.details["event_rank"] = 1
+            day1 = datetime(2026, 7, 30, 14, 15, tzinfo=TZ)
+            service.state.save_active_signal("600362.SH", {
+                "code": first.code,
+                "event_id": first.event_id,
+                "semantic_key": service._semantic_event_key(first),
+                "date": "2026-07-30",
+                "first_seen_date": "2026-07-30",
+                "last_notified_date": "2026-07-30",
+                "reminder_count": 0,
+            })
+            service.state.mark_sent(
+                first.event_id, day1.date(), "strategy", rank=1,
+                semantic_key=service._semantic_event_key(first),
+            )
+            next_day = signal("600362.SH", "MIGRATION_TRIM", "strategy")
+            next_day.event_id = "2026-07-31|600362.SH:MIGRATION_TRIM:42.00"
+            sendable, suppressed = service._filter_sendable(
+                [next_day], datetime(2026, 7, 31, 10, 15, tzinfo=TZ)
+            )
+            self.assertEqual([item.code for item in sendable], ["MIGRATION_TRIM"])
+            self.assertTrue(sendable[0].details["pending_reminder"])
+            self.assertEqual(suppressed, [])
+
+    def test_pending_reduction_reminder_is_once_per_day_then_cools_down(self):
+        with TemporaryDirectory() as directory:
+            service = MonitorService(self._config(Path(directory)))
+            current = signal("600362.SH", "MIGRATION_TRIM", "strategy")
+            current.event_id = "2026-07-31|600362.SH:MIGRATION_TRIM:42.00"
+            service.state.save_active_signal("600362.SH", {
+                "code": current.code,
+                "event_id": current.event_id,
+                "semantic_key": service._semantic_event_key(current),
+                "date": "2026-07-31",
+                "first_seen_date": "2026-07-30",
+                "last_notified_date": "2026-07-30",
+                "reminder_count": 0,
+            })
+            service.state.mark_sent(
+                current.event_id, date(2026, 7, 30), "strategy", rank=1,
+                semantic_key=service._semantic_event_key(current),
+            )
+            next_day = datetime(2026, 7, 31, 13, 15, tzinfo=TZ)
+            sendable, _ = service._filter_sendable([current], next_day)
+            self.assertEqual(len(sendable), 1)
+            service._record_reduction_notification(current, next_day.date())
+            same_day, suppressed = service._filter_sendable(
+                [current],
+                datetime(2026, 7, 31, 14, 15, tzinfo=TZ),
+            )
+            self.assertEqual(same_day, [])
+            self.assertEqual(suppressed[0]["reason"], "duplicate_event")
+            cooldown, _ = service._filter_sendable(
+                [current],
+                datetime(2026, 8, 3, 10, 15, tzinfo=TZ),
+            )
+            self.assertEqual(cooldown, [])
+            due, _ = service._filter_sendable(
+                [current],
+                datetime(2026, 8, 4, 10, 15, tzinfo=TZ),
+            )
+            self.assertEqual(len(due), 1)
+
     def test_technical_freshness_checks_bars_and_previous_daily_session(self):
         with TemporaryDirectory() as directory:
             service = MonitorService(self._config(Path(directory)))
@@ -100,6 +168,81 @@ class ServicePolicyTests(unittest.TestCase):
             )
             self.assertFalse(fresh)
             self.assertEqual(len(reasons), 3)
+
+    def test_watchlist_candidate_inherits_sector_correlation_cap(self):
+        with TemporaryDirectory() as directory:
+            holding = Position(
+                "601336.SH", "新华保险", 600, 30000, "insurance", 100, 300, (),
+                SatellitePosition(),
+            )
+            candidate = Position(
+                "601628.SH", "中国人寿观察", 0, 0, "insurance", 100, 300, (),
+                SatellitePosition(), role="watchlist",
+            )
+            config = self._config(Path(directory))
+            config.raw["risk"]["correlation_groups"] = {
+                "insurance": {
+                    "symbols": ["601336.SH"],
+                    "sectors": ["insurance"],
+                    "max_ratio": 0.40,
+                }
+            }
+            service = MonitorService(
+                AppConfig(raw=config.raw, positions=(holding, candidate))
+            )
+            weight, cap = service._correlated_exposure(
+                "601628.SH",
+                {
+                    "601336.SH": Quote(
+                        "601336.SH", "新华保险", datetime(2026, 7, 30, 10, 15, tzinfo=TZ),
+                        50, 50, 50, 50, 50, 1, 1,
+                    ),
+                    "601628.SH": Quote(
+                        "601628.SH", "中国人寿观察", datetime(2026, 7, 30, 10, 15, tzinfo=TZ),
+                        30, 30, 30, 30, 30, 1, 1,
+                    ),
+                },
+                100000,
+            )
+            self.assertAlmostEqual(weight, 0.30)
+            self.assertEqual(cap, 0.40)
+
+    def test_overlapping_correlation_groups_use_smallest_remaining_room(self):
+        with TemporaryDirectory() as directory:
+            holding = Position(
+                "601336.SH", "新华保险", 600, 30000, "insurance", 100, 300, (),
+                SatellitePosition(),
+            )
+            candidate = Position(
+                "601628.SH", "中国人寿观察", 0, 0, "insurance", 100, 300, (),
+                SatellitePosition(), role="watchlist",
+            )
+            config = self._config(Path(directory))
+            config.raw["risk"]["correlation_groups"] = {
+                "insurance_standard": {
+                    "symbols": ["601336.SH"], "sectors": ["insurance"], "max_ratio": 0.40,
+                },
+                "insurance_tight": {
+                    "symbols": ["601628.SH"], "sectors": ["insurance"], "max_ratio": 0.35,
+                },
+            }
+            service = MonitorService(AppConfig(raw=config.raw, positions=(holding, candidate)))
+            weight, cap = service._correlated_exposure(
+                "601628.SH",
+                {
+                    "601336.SH": Quote(
+                        "601336.SH", "新华保险", datetime(2026, 7, 30, 10, 15, tzinfo=TZ),
+                        50, 50, 50, 50, 50, 1, 1,
+                    ),
+                    "601628.SH": Quote(
+                        "601628.SH", "中国人寿观察", datetime(2026, 7, 30, 10, 15, tzinfo=TZ),
+                        30, 30, 30, 30, 30, 1, 1,
+                    ),
+                },
+                100000,
+            )
+            self.assertAlmostEqual(weight, 0.30)
+            self.assertEqual(cap, 0.35)
 
     @staticmethod
     def _config(root: Path) -> AppConfig:

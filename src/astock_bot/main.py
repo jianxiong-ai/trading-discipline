@@ -63,19 +63,23 @@ def main() -> int:
         tz = ZoneInfo(config.timezone)
         now = datetime.now(tz)
         window = int(config.raw.get("run_window_seconds", 180))
+        recovery_window = max(window, int(config.raw.get("recovery_window_seconds", 900)))
         for node in config.schedule:
             hour, minute = (int(x) for x in node.split(":"))
             scheduled = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
             delta = (now - scheduled).total_seconds()
-            if 0 <= delta <= window:
+            if 0 <= delta <= recovery_window:
                 service = MonitorService(config)
-                if service.state.ran(now.date(), node):
+                if not service.state.claim_run(now.date(), node):
                     continue
                 try:
-                    result = service.run_node(node, now=now, execution_type="scheduled")
+                    execution_type = "scheduled" if delta <= window else "scheduled_recovery"
+                    result = service.run_node(node, now=now, execution_type=execution_type)
                     print(json.dumps({"timestamp": now.isoformat(), **result}, ensure_ascii=False, default=str), flush=True)
-                    service.state.mark_ran(now.date(), node)
                 except Exception as exc:
+                    # Feishu may have accepted the request before a client
+                    # timeout. Keep the at-most-once claim to prevent a
+                    # duplicate notification on the next scheduler poll.
                     print(json.dumps({"timestamp": now.isoformat(), "node": node, "error": str(exc)}, ensure_ascii=False), file=sys.stderr, flush=True)
         summary_config = config.section("daily_summary")
         if bool(summary_config.get("enabled", False)):
@@ -84,15 +88,15 @@ def main() -> int:
             scheduled = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
             delta = (now - scheduled).total_seconds()
             state_key = f"summary:{summary_time}"
-            if 0 <= delta <= window:
+            if 0 <= delta <= recovery_window:
                 service = MonitorService(config)
-                if not service.state.ran(now.date(), state_key):
+                if service.state.claim_run(now.date(), state_key):
                     try:
                         result = service.run_daily_summary(now=now)
                         print(json.dumps({"timestamp": now.isoformat(), **result}, ensure_ascii=False, default=str), flush=True)
-                        if result.get("decision") == "SUMMARY_SENT":
-                            service.state.mark_ran(now.date(), state_key)
                     except Exception as exc:
+                        # A summary timeout is also an uncertain delivery;
+                        # do not automatically resend it.
                         print(json.dumps({"timestamp": now.isoformat(), "node": summary_time, "error": str(exc)}, ensure_ascii=False), file=sys.stderr, flush=True)
         time.sleep(15)
 

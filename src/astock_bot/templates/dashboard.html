@@ -1,29 +1,51 @@
 {% extends "base.html" %}
 {% block content %}
-<section class="page-bar">
-  <h1>组合看板</h1>
-  <div class="cash"><span>可用资金</span><strong>¥{{ '%.2f'|format(cash) }}</strong></div>
+<section class="page-title">
+  <div><p class="eyebrow">PORTFOLIO</p><h1>今天需要做什么</h1></div>
+  <div class="cash"><span>可用资金</span><strong>¥{{ '{:,.2f}'.format(cash) }}</strong></div>
 </section>
-<section class="metrics">
-  <article><span>正式持仓</span><strong>{{ holdings|length }}只</strong></article>
-  <article><span>活动卫星仓</span><strong>{{ holdings|selectattr('satellite.active')|list|length }}只</strong></article>
-  <article><span>观察标的</span><strong>{{ watchlist|length }}只</strong></article>
+
+<section class="status-strip">
+  <div><strong>{{ holdings|length }}</strong><span>主仓标的</span></div>
+  <div><strong>{{ holdings|selectattr('satellite.active')|list|length }}</strong><span>活动卫星仓</span></div>
+  <div><strong>{{ watchlist|length }}</strong><span>观察标的</span></div>
 </section>
-<section class="panel">
-  <div class="section-head"><h2>当前持仓</h2><a href="/positions">录入成交</a></div>
-  <div class="table-wrap"><table><thead><tr><th>标的</th><th>主仓</th><th>卫星仓</th><th>行业</th><th>状态</th></tr></thead><tbody>
-  {% for p in holdings %}<tr><td><b>{{ p.name }}</b><br><small>{{ p.symbol }}</small></td><td>{{ p.main_shares }}股</td><td>{% if p.satellite.active %}{{ p.satellite.shares }}股{% else %}未启用{% endif %}</td><td>{{ p.sector }}</td><td><span class="tag">正式持仓</span></td></tr>{% else %}<tr><td colspan="5">暂无正式持仓</td></tr>{% endfor %}
-  </tbody></table></div>
-</section>
-<section class="grid-two">
-  <article class="panel"><div class="section-head"><h2>日内总结</h2><a href="/watchlist">查看全部</a></div>
-  {% if latest_summary %}
-    <p class="muted">{{ latest_summary.timestamp[:16].replace('T', ' ') }} · {{ latest_summary.decision }}</p>
-    {% for row in latest_summary.summaries[:3] %}<div class="summary-row"><b>{{ row.name }}</b><span>{{ row.recommendation }}</span><small>{{ row.reason }}</small></div>{% endfor %}
-  {% else %}<p class="empty">暂无日内总结</p>{% endif %}
-  </article>
-  <article class="panel"><div class="section-head"><h2>最近操作建议</h2><span class="muted">未成交不改仓</span></div>
-  {% for item in recent_actions %}<div class="summary-row"><b>{{ item.node }}</b><span>{% for signal in item.signals %}{{ signal.name }}：{{ signal.action }}{% if not loop.last %}；{% endif %}{% endfor %}</span></div>{% else %}<p class="empty">暂无操作建议</p>{% endfor %}
-  </article>
+
+<section class="layout-main">
+  <div class="stack">
+    <article class="panel">
+      <div class="section-head"><div><p class="eyebrow">ACTION</p><h2>最新纪律结论</h2></div><a href="/watchlist">查看复盘</a></div>
+      {% if recent_actions %}
+        {% set item = recent_actions[0] %}
+        <div class="action-card">
+          <span class="badge warning">需复核</span>
+          <div><strong>{% for signal in item.signals %}{{ signal.name }}：{{ signal.action }}{% if signal.shares %} {{ signal.shares }}股{% endif %}{% if not loop.last %}；{% endif %}{% endfor %}</strong><p>{{ item.timestamp[:16].replace('T', ' ') }} · 节点 {{ item.node }}</p></div>
+        </div>
+      {% elif latest_summary %}
+        <div class="action-card"><span class="badge ok">无动作</span><div><strong>{{ latest_summary.decision }}</strong><p>{{ latest_summary.timestamp[:16].replace('T', ' ') }} · 继续按节点观察</p></div></div>
+      {% else %}<p class="empty">暂无当日分析记录。</p>{% endif %}
+    </article>
+
+    <article class="panel">
+      <div class="section-head"><div><p class="eyebrow">HOLDINGS</p><h2>当前持仓</h2></div><a href="/positions">录入成交</a></div>
+      <div class="simple-list">
+      {% for p in holdings %}
+        <div class="security-row">
+          <div class="security"><span class="avatar">{{ p.name[:1] }}</span><div><strong>{{ p.name }}</strong><small>{{ p.symbol }}</small></div></div>
+          <div class="number"><strong>{{ p.main_shares }}股</strong><small>主仓</small></div>
+          <div class="number"><strong>{% if p.satellite.active %}{{ p.satellite.shares }}股{% else %}—{% endif %}</strong><small>卫星仓</small></div>
+        </div>
+      {% else %}<p class="empty">暂无正式持仓。</p>{% endfor %}
+      </div>
+    </article>
+  </div>
+
+  <aside class="panel summary-panel">
+    <div class="section-head"><div><p class="eyebrow">SUMMARY</p><h2>日内总结</h2></div></div>
+    {% if latest_summary %}
+      <p class="as-of">{{ latest_summary.timestamp[:16].replace('T', ' ') }}</p>
+      {% for row in latest_summary.review_rows[:4] %}<div class="brief"><strong>{{ row.name }} <small>{{ row.symbol }}{% if row.price is not none %} · {{ '{:.2f}'.format(row.price) }}{% endif %}{% if row.change_pct is not none %} · {{ '{:+.2f}%'.format(row.change_pct) }}{% endif %}</small></strong><span>{{ row.recommendation }}</span><p>{{ row.reason }}</p></div>{% endfor %}
+    {% else %}<p class="empty">15:30 后生成当日总结。</p>{% endif %}
+  </aside>
 </section>
 {% endblock %}

@@ -24,6 +24,7 @@ from .models import EquityEvidence, EvidenceItem, Position
 
 
 SSE_ANNOUNCEMENT_URL = "https://query.sse.com.cn/security/stock/queryCompanyBulletin.do"
+SZSE_ANNOUNCEMENT_URL = "https://www.szse.cn/api/disc/announcement/annList"
 SSE_MARGIN_URL = "https://query.sse.com.cn/commonSoaQuery.do"
 SZSE_MARGIN_URL = "https://www.szse.cn/api/report/ShowReport/data"
 # push2 在部分网络会被掐连接；delay 节点更稳，历史序列靠本地滚动缓存补齐。
@@ -218,6 +219,14 @@ class OfficialEvidenceCollector:
             fresh_industry = [item for item in industry_items if item.freshness == "fresh"]
             industry_status = industry_statuses.get(position.sector, "missing")
             industry_direction = _aggregate_direction(fresh_industry)
+            industry_strength = max(
+                (
+                    int(item.strength)
+                    for item in fresh_industry
+                    if item.direction > 0
+                ),
+                default=0,
+            )
             company_items = [
                 item for item in announcement_items
                 if item.fact_type == "company_operating_metric"
@@ -288,6 +297,10 @@ class OfficialEvidenceCollector:
                 announcement_status=announcement_status,
                 announcement_risk=announcement_risk,
                 summary="；".join(summary_parts),
+                industry_strength=industry_strength,
+                industry_is_macro_proxy=position.sector in {
+                    "insurance", "insurance_financial_group"
+                },
                 company_status=company_status,
                 company_direction=company_direction,
                 items=items,
@@ -763,9 +776,6 @@ class OfficialEvidenceCollector:
         )
 
     def _announcements(self, symbol: str, as_of: datetime) -> list[EvidenceItem]:
-        if not symbol.endswith(".SH"):
-            # 不把上交所返回空结果误当成深市“公告无风险”；未接入即明确缺失。
-            raise EvidenceSourceError("深交所公告结构化查询尚不可用")
         code = symbol.split(".")[0]
         settings = self.config.get("announcements", {})
         lookback = int(settings.get("lookback_calendar_days", 14))
@@ -776,43 +786,60 @@ class OfficialEvidenceCollector:
         action_settings = self.config.get("corporate_actions", {})
         action_enabled = bool(action_settings.get("enabled", True))
         begin = as_of.date() - timedelta(days=lookback)
-        # 上交所盘后公告有时归入下一自然日归档桶。向后查询一天后仍严格按
-        # ADDDATE <= as_of 过滤，既避免漏掉盘后公告，也不会读取未来信息。
+        # 交易所盘后公告有时归入下一自然日归档桶。向后查询一天后仍严格按
+        # 公告时间 <= as_of 过滤，既避免漏掉盘后公告，也不会读取未来信息。
         query_end = as_of.date() + timedelta(
             days=int(action_settings.get("sse_archive_lookahead_days", 1))
             if action_enabled else 0
         )
-        params = {
-            "isPagination": "true",
-            "productId": code,
-            "keyWord": "",
-            "securityType": "0101,120100,020100,020200,120200",
-            "reportType2": "",
-            "reportType": "ALL",
-            "beginDate": begin.isoformat(),
-            "endDate": query_end.isoformat(),
-            "pageHelp.pageSize": 25,
-            "pageHelp.pageNo": 1,
-            "pageHelp.beginPage": 1,
-            "pageHelp.cacheSize": 1,
-            "pageHelp.endPage": 1,
-        }
         rows: list[dict[str, Any]] = []
         max_pages = max(int(settings.get("max_pages", 5)), 1)
-        for page_no in range(1, max_pages + 1):
-            params["pageHelp.pageNo"] = page_no
-            params["pageHelp.beginPage"] = page_no
-            params["pageHelp.endPage"] = page_no
-            payload = self._get_json(
-                f"{SSE_ANNOUNCEMENT_URL}?{urlencode(params)}",
-                "https://www.sse.com.cn/assortment/stock/list/info/announcement/",
-            )
-            page_help = payload.get("pageHelp") or {}
-            page_rows = page_help.get("data") or payload.get("result") or []
-            rows.extend(page_rows)
-            page_count = int(page_help.get("pageCount") or 1)
-            if page_no >= page_count or not page_rows:
-                break
+        exchange = "上海证券交易所" if symbol.endswith(".SH") else "深圳证券交易所"
+        if symbol.endswith(".SH"):
+            params = {
+                "isPagination": "true", "productId": code, "keyWord": "",
+                "securityType": "0101,120100,020100,020200,120200",
+                "reportType2": "", "reportType": "ALL", "beginDate": begin.isoformat(),
+                "endDate": query_end.isoformat(), "pageHelp.pageSize": 25,
+                "pageHelp.pageNo": 1, "pageHelp.beginPage": 1,
+                "pageHelp.cacheSize": 1, "pageHelp.endPage": 1,
+            }
+            for page_no in range(1, max_pages + 1):
+                params.update({"pageHelp.pageNo": page_no, "pageHelp.beginPage": page_no, "pageHelp.endPage": page_no})
+                payload = self._get_json(f"{SSE_ANNOUNCEMENT_URL}?{urlencode(params)}", "https://www.sse.com.cn/assortment/stock/list/info/announcement/")
+                page_help = payload.get("pageHelp") or {}
+                page_rows = page_help.get("data") or payload.get("result") or []
+                rows.extend(page_rows)
+                if page_no >= int(page_help.get("pageCount") or 1) or not page_rows:
+                    break
+        elif symbol.endswith(".SZ"):
+            # The live SZSE page now posts JSON to annList.  The older GET
+            # shape (channelCode=fixed_disc/secCode/seDate=range) returns 500
+            # in production even though the endpoint path still exists.
+            page_size = 50
+            for page_no in range(1, max_pages + 1):
+                payload = self._post_json(
+                    f"{SZSE_ANNOUNCEMENT_URL}?random=0.5",
+                    {
+                        "stock": [code],
+                        "channelCode": ["listedNotice_disc"],
+                        "seDate": [begin.isoformat(), query_end.isoformat()],
+                        "pageSize": page_size,
+                        "pageNum": page_no,
+                    },
+                    "https://www.szse.cn/disclosure/listed/notice/index.html",
+                )
+                page_rows = payload.get("data") or []
+                rows.extend(page_rows)
+                total_count = int(payload.get("announceCount") or 0)
+                if (
+                    not page_rows
+                    or len(page_rows) < page_size
+                    or (total_count and len(rows) >= total_count)
+                ):
+                    break
+        else:
+            raise EvidenceSourceError("不支持的交易所代码")
         critical = tuple(settings.get("critical_keywords", DEFAULT_CRITICAL_KEYWORDS))
         caution = tuple(settings.get("caution_keywords", DEFAULT_CAUTION_KEYWORDS))
         result: list[EvidenceItem] = []
@@ -824,10 +851,10 @@ class OfficialEvidenceCollector:
         parsed_documents = 0
         action_candidates: list[dict[str, Any]] = []
         for row in rows:
-            title = _clean_text(str(row.get("TITLE") or ""))
+            title = _clean_text(str(row.get("TITLE") or row.get("title") or ""))
             if not title:
                 continue
-            published_at = _parse_sse_datetime(row, self.tz)
+            published_at = _parse_announcement_datetime(row, self.tz)
             if published_at > as_of:
                 continue
             age = (as_of.date() - published_at.date()).days
@@ -836,18 +863,16 @@ class OfficialEvidenceCollector:
             # 高风险事项使用更长观察窗；普通风险标题到期后只保留上下文。
             if age < 0 or age > active_window:
                 risk, direction, strength = "none", 0, 0
-            relative_url = str(row.get("URL") or "").replace("\\/", "/")
-            source_url = (
-                relative_url if relative_url.startswith("http")
-                else f"https://www.sse.com.cn{relative_url}"
-            )
+            relative_url = str(row.get("URL") or row.get("attachPath") or row.get("adjunctUrl") or "").replace("\\/", "/")
+            base_url = "https://www.sse.com.cn" if symbol.endswith(".SH") else "https://disc.static.szse.cn"
+            source_url = relative_url if relative_url.startswith("http") else urljoin(base_url + "/", relative_url.lstrip("/"))
             title_item = EvidenceItem(
                 key=(
-                    f"sse-announcement-{code}-{published_at.isoformat()}-"
+                    f"{'sse' if symbol.endswith('.SH') else 'szse'}-announcement-{code}-{published_at.isoformat()}-"
                     f"{hashlib.sha256(title.encode('utf-8')).hexdigest()[:12]}"
                 ),
                 label=f"公司公告/{risk}",
-                source="上海证券交易所",
+                source=exchange,
                 source_url=source_url,
                 observed_at=published_at,
                 direction=direction,
@@ -883,7 +908,7 @@ class OfficialEvidenceCollector:
                         result.append(EvidenceItem(
                             key=f"{title_item.key}-operating",
                             label="公司经营指标",
-                            source="上海证券交易所/公司公告正文",
+                            source=f"{exchange}/公司公告正文",
                             source_url=source_url,
                             observed_at=published_at,
                             direction=direction,
@@ -984,7 +1009,7 @@ class OfficialEvidenceCollector:
                 f"正向公司行动/{selected['action_type']}/{selected['stage']}/"
                 f"{body_status}"
             ),
-            source="上海证券交易所/公司公告正文",
+            source=f"{('上海证券交易所' if selected['source_url'].startswith('https://www.sse.com.cn') else '深圳证券交易所')}/公司公告正文",
             source_url=selected["source_url"],
             observed_at=selected["observed_at"],
             direction=direction,
@@ -1123,11 +1148,35 @@ class OfficialEvidenceCollector:
     def _capital_flow(
         self, symbol: str, as_of: datetime
     ) -> tuple[EvidenceItem, str, float]:
-        """东财主力净流入辅助层：当日拉取 + 本地滚动缓存，不单独触发买卖。"""
+        """东财主力净流入辅助层；仅完整交易日可参与门控。"""
         settings = self.config.get("capital_flow", {})
         lookback = int(settings.get("lookback_sessions", 5))
         observed_date, main_net, main_pct = self._fetch_today_main_flow(symbol)
         history = self._load_fflow_history(symbol)
+        local_now = as_of.astimezone(self.tz)
+        intraday_partial = (
+            observed_date == local_now.date()
+            and (local_now.hour, local_now.minute) < (15, 10)
+        )
+        if intraday_partial:
+            # The feed updates through the day. Do not overwrite a completed-day
+            # observation or call it "日终" before the market has closed.
+            item = EvidenceItem(
+                key=f"capital-flow-intraday-{symbol}-{observed_date.isoformat()}",
+                label="主力资金流向（盘中，仅展示）",
+                source="东方财富",
+                source_url=f"https://data.eastmoney.com/zjlx/{symbol.split('.')[0]}.html",
+                observed_at=local_now,
+                direction=0,
+                strength=0,
+                summary=(
+                    f"盘中主力净流入暂值{main_net / 1e8:+.2f}亿元"
+                    f"（占换手{main_pct:+.2f}%）；未收盘，不参与新增、减仓或择优门控"
+                ),
+                freshness="partial",
+                fact_type="capital_flow_intraday_partial",
+            )
+            return item, "intraday_partial", 0.0
         history[observed_date.isoformat()] = {
             "main_net": main_net,
             "main_pct": main_pct,
@@ -1312,6 +1361,15 @@ class OfficialEvidenceCollector:
     def _get_json(self, url: str, referer: str) -> dict[str, Any]:
         return json.loads(self._request(url, referer).decode("utf-8"))
 
+    def _post_json(
+        self, url: str, payload: dict[str, Any], referer: str
+    ) -> dict[str, Any]:
+        return json.loads(
+            self._request(url, referer, method="POST", json_payload=payload).decode(
+                "utf-8"
+            )
+        )
+
     def _get_text(self, url: str, referer: str) -> str:
         return self._request(url, referer).decode("utf-8", errors="replace")
 
@@ -1342,16 +1400,37 @@ class OfficialEvidenceCollector:
                 errors.append(str(exc))
         raise EvidenceSourceError("；".join(errors[-2:]))
 
-    def _request(self, url: str, referer: str) -> bytes:
+    def _request(
+        self,
+        url: str,
+        referer: str,
+        *,
+        method: str = "GET",
+        json_payload: dict[str, Any] | None = None,
+    ) -> bytes:
         last_error: Exception | None = None
         for attempt in range(self.retries + 1):
             try:
+                body = (
+                    json.dumps(json_payload, ensure_ascii=False).encode("utf-8")
+                    if json_payload is not None
+                    else None
+                )
                 request = Request(
                     url,
+                    data=body,
+                    method=method,
                     headers={
                         "User-Agent": "Mozilla/5.0 astock-discipline-bot/0.2",
                         "Referer": referer,
                         "Accept": "application/json,text/html,*/*",
+                        "X-Request-Type": "ajax",
+                        "X-Requested-With": "XMLHttpRequest",
+                        **(
+                            {"Content-Type": "application/json"}
+                            if body is not None
+                            else {}
+                        ),
                     },
                 )
                 with urlopen(request, timeout=self.timeout) as response:
@@ -1903,18 +1982,22 @@ def classify_operating_text(text: str, threshold_pct: float = 3.0) -> tuple[int 
     return 0, "公司经营公告正文未识别出可解释且达到阈值的同比变化"
 
 
-def _parse_sse_datetime(row: dict[str, Any], tz: ZoneInfo) -> datetime:
-    raw = str(row.get("ADDDATE") or "").strip()
+def _parse_announcement_datetime(row: dict[str, Any], tz: ZoneInfo) -> datetime:
+    raw = str(row.get("ADDDATE") or row.get("publishTime") or row.get("publishDate") or "").strip()
     for format_ in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
         try:
             return datetime.strptime(raw, format_).replace(tzinfo=tz)
         except ValueError:
             continue
-    raw_date = str(row.get("SSEDATE") or row.get("SSEDate") or "").strip()
+    raw_date = str(row.get("SSEDATE") or row.get("SSEDate") or row.get("publishDate") or "").strip()
     try:
         return datetime.strptime(raw_date, "%Y-%m-%d").replace(tzinfo=tz)
     except ValueError as exc:
         raise EvidenceSourceError(f"公告时间无法识别: {raw or raw_date}") from exc
+
+
+# Backwards-compatible private helper used by existing integrations/tests.
+_parse_sse_datetime = _parse_announcement_datetime
 
 
 def _highest_announcement_risk(items: list[EvidenceItem]) -> str:

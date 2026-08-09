@@ -17,19 +17,14 @@ log() {
 is_market_day() {
   local config_file="$1"
   /usr/bin/python3 - "$config_file" <<'PY'
-import re
-import sys
+import re, sys
 from datetime import date
 from pathlib import Path
 
-today = date.today()
-if today.weekday() >= 5:
-    raise SystemExit(1)
-
-text = Path(sys.argv[1]).read_text(encoding="utf-8")
-match = re.search(r"(?ms)^holidays:\s*(.*?)(?=^[A-Za-z_][A-Za-z0-9_]*:\s*|\Z)", text)
-holidays = set(re.findall(r"\d{4}-\d{2}-\d{2}", match.group(1) if match else ""))
-raise SystemExit(1 if today.isoformat() in holidays else 0)
+project = Path(sys.argv[1]).resolve().parent
+sys.path.insert(0, str(project / "src"))
+from astock_bot.market_calendar import is_market_day
+raise SystemExit(0 if is_market_day(sys.argv[1], date.today()) else 1)
 PY
 }
 

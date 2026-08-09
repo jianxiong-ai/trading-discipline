@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import math
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Any
 import yaml
 
 from .models import Position, SatellitePosition
+from .market_calendar import resolve_holidays
 from .portfolio_store import PortfolioStore
 
 
@@ -51,6 +53,8 @@ def load_config(path: str | Path) -> AppConfig:
     config_path = Path(path)
     with config_path.open("r", encoding="utf-8") as handle:
         raw = _expand(yaml.safe_load(handle) or {})
+    # Exchange-first calendar; manually listed dates remain a local override.
+    raw["holidays"] = sorted(resolve_holidays(raw, config_path))
     # Strategy rules remain in YAML; confirmed portfolio facts live in the
     # optional shared SQLite ledger so the monitor and local web UI agree.
     store = PortfolioStore.from_config(config_path, raw)
@@ -104,6 +108,15 @@ def load_config(path: str | Path) -> AppConfig:
                 watchlist_entry_date if isinstance(watchlist_entry_date, date) else None
             ),
             corporate_events=corporate_events,
+            risk_principal=_optional_float(
+                item.get(
+                    "risk_principal",
+                    item.get("migration", {}).get(
+                        "risk_principal_ceiling",
+                        max(float(item.get("economic_basis", 0)), 0.0),
+                    ),
+                )
+            ),
         )
         _validate_position(position)
         positions.append(position)
@@ -114,7 +127,12 @@ def load_config(path: str | Path) -> AppConfig:
 
 
 def _optional_float(value: Any) -> float | None:
-    return None if value in (None, "") else float(value)
+    if value in (None, ""):
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("价格、费用、经济投入等数值不能是NaN或Inf")
+    return number
 
 
 def _normalize_corporate_event(raw: Any, symbol: str) -> dict[str, Any]:
@@ -132,13 +150,24 @@ def _normalize_corporate_event(raw: Any, symbol: str) -> dict[str, Any]:
     if ex < record:
         raise ValueError(f"{symbol} cash_dividend ex_date 不得早于 record_date")
     cash = float(raw.get("cash_per_share", 0) or 0)
+    if not math.isfinite(cash):
+        raise ValueError(f"{symbol} cash_per_share 不能是NaN或Inf")
     if cash < 0:
         raise ValueError(f"{symbol} cash_per_share 不得为负")
+    eligible_shares = raw.get("eligible_shares")
+    if eligible_shares not in (None, ""):
+        try:
+            eligible_shares = int(eligible_shares)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{symbol} cash_dividend eligible_shares 必须是非负整数") from exc
+        if eligible_shares < 0:
+            raise ValueError(f"{symbol} cash_dividend eligible_shares 必须是非负整数")
     return {
         "type": event_type,
         "record_date": record.isoformat(),
         "ex_date": ex.isoformat(),
         "cash_per_share": cash,
+        "eligible_shares": eligible_shares,
         "basis_adjusted": bool(raw.get("basis_adjusted", False)),
         "note": str(raw.get("note") or ""),
     }
@@ -155,10 +184,6 @@ def _validate_position(position: Position) -> None:
         raise ValueError(f"{position.symbol} satellite_limit 必须是正100股整数")
     if position.main_adjustment_shares <= 0 or position.main_adjustment_shares % 100:
         raise ValueError(f"{position.symbol} main_adjustment_shares 必须是正100股整数")
-    if position.economic_basis < 0:
-        raise ValueError(f"{position.symbol} economic_basis 不得小于0")
-    if position.total_shares > 0 and position.economic_basis <= 0:
-        raise ValueError(f"{position.symbol} 有持仓时 economic_basis 必须大于0")
     if position.role == "holding" and position.total_shares <= 0:
         raise ValueError(f"{position.symbol} holding 必须有实际持仓；空仓请改为watchlist")
     if position.watchlist_entry_date is not None and position.watchlist_entry_date > date.today():
@@ -227,14 +252,16 @@ def _validate_position(position: Position) -> None:
     elif position.satellite.shares != 0:
         raise ValueError(f"{position.symbol} 未激活卫星仓时 shares 必须为0")
     if position.role == "watchlist":
-        if position.main_shares != 0 or position.economic_basis != 0:
-            raise ValueError(f"{position.symbol} watchlist 必须保持 main_shares=0 且 economic_basis=0")
+        if position.main_shares != 0 or position.economic_basis != 0 or position.risk_principal not in (None, 0):
+            raise ValueError(f"{position.symbol} watchlist 必须保持 main_shares=0、economic_basis=0 且 risk_principal=0")
         if position.satellite.active or position.satellite.shares != 0:
             raise ValueError(f"{position.symbol} watchlist 不得持有卫星仓")
         if bool(position.migration.get("enabled", False)):
             raise ValueError(f"{position.symbol} watchlist 不得启用存量仓迁移模式")
         if position.watchlist_entry_date is not None:
             raise ValueError(f"{position.symbol} watchlist 尚未成交，不得配置 watchlist_entry_date")
+    elif position.total_shares > 0 and (position.risk_principal is None or position.risk_principal <= 0):
+        raise ValueError(f"{position.symbol} 有持仓时 risk_principal 必须大于0")
 
 
 def _validate_config(raw: dict[str, Any], positions: list[Position]) -> None:
@@ -326,8 +353,13 @@ def _validate_config(raw: dict[str, Any], positions: list[Position]) -> None:
     grouped_symbols: dict[str, str] = {}
     for name, group in risk.get("correlation_groups", {}).items():
         symbols = {str(symbol).upper() for symbol in group.get("symbols", [])}
-        if not symbols or not symbols.issubset(known):
-            raise ValueError(f"相关性分组{name}包含未知或空证券列表")
+        sectors = {str(sector) for sector in group.get("sectors", [])}
+        if not symbols and not sectors:
+            raise ValueError(f"相关性分组{name}至少需要 symbols 或 sectors")
+        if not symbols.issubset(known):
+            raise ValueError(f"相关性分组{name}包含未知证券代码")
+        if any(not sector for sector in sectors):
+            raise ValueError(f"相关性分组{name}包含空行业")
         group_cap = float(group.get("max_ratio", 0))
         if not 0 < group_cap <= 1:
             raise ValueError(f"相关性分组{name}的 max_ratio 必须在(0, 1]之间")
@@ -571,6 +603,9 @@ def _validate_config(raw: dict[str, Any], positions: list[Position]) -> None:
         reset_drawdown = float(stage.get("top_state_reset_drawdown_ratio", 0.20))
         if not 0 < reset_drawdown < 1:
             raise ValueError("stage_rules.top_state_reset_drawdown_ratio 必须在(0, 1)之间")
+        rearm_new_high = float(stage.get("top_rearm_new_high_ratio", 0.03))
+        if not 0 < rearm_new_high < 1:
+            raise ValueError("stage_rules.top_rearm_new_high_ratio 必须在(0, 1)之间")
         if not 1 <= int(stage.get("bottom_confirmation_score", 5)) <= 6:
             raise ValueError("bottom_confirmation_score 必须在[1, 6]范围")
         if not 1 <= int(stage.get("top_confirmation_score", 5)) <= 7:

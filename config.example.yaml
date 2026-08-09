@@ -4,6 +4,14 @@ daily_summary:
   enabled: true
   time: "15:30"
 run_window_seconds: 180
+recovery_window_seconds: 900 # 容器迟起时最多补跑15分钟内的节点；外部通知按持久化claim去重
+# 交易日历优先读取上交所官方年度休市安排；holidays 仅作为本地覆盖/应急兜底。
+trading_calendar:
+  enabled: true
+  official_url: https://www.sse.com.cn/disclosure/dealinstruc/closed/
+  cache_path: data/trading_calendar.json
+  refresh_hours: 24
+  timeout_seconds: 5
 holidays:
   # 2026 年上交所公布的 A 股休市日；周末另由程序自动跳过。
   - "2026-01-01"
@@ -54,6 +62,16 @@ data_source:
   minimum_fresh_peer_count: 2
   minimum_fresh_index_count: 3
 
+# 股票池智能接入：公开公司资料 + 确定性行业规则为基础；只有页面主动勾选且
+# LLM_API_KEY 已配置时才调用 DeepSeek 复核。LLM 不参与交易信号计算。
+onboarding:
+  llm_enabled: true
+  llm_base_url: https://api.deepseek.com
+  llm_model: deepseek-v4-flash
+  profile_timeout_seconds: 8
+  profile_retries: 2
+  llm_timeout_seconds: 30
+
 # Public Equity Investing 证据层：只读取一手公开来源，不连接 FactSet。
 # 产业数据为日终证据；公告标题只做风险筛选，经营类PDF正文只提取可核验同比指标。
 evidence:
@@ -82,7 +100,8 @@ evidence:
     positive_sales_yoy_pct: 5.0
     negative_sales_yoy_pct: -5.0
   satellite_communications:
-    max_age_calendar_days: 120
+    # 事件型催化必须快速衰减，不能用数月前的一次发射持续确认新增仓位。
+    max_age_calendar_days: 30
     positive_keywords: [成功发射, 顺利进入预定轨道, 批量颁发, 商用试验, 正式开通]
     negative_keywords: [发射失败, 任务失败, 发生异常, 事故, 暂停, 撤销许可]
   semiconductor:
@@ -162,6 +181,8 @@ notification:
   title: A股持仓纪律
   evidence_char_limit: 240
   margin_char_limit: 120
+  pending_reduction_reminder_first_days: 1
+  pending_reduction_reminder_repeat_days: 2
 
 risk:
   max_loss_ratio: 0.25
@@ -176,6 +197,8 @@ risk:
   correlation_groups:
     insurance:
       symbols: [601336.SH, 601318.SH]
+      # 新增保险/综合金融标的自动纳入同一相关性桶。
+      sectors: [insurance, insurance_financial_group]
       max_ratio: 0.40
 
 # 计划金额先按账户净资产比例生成，再受100股整数、现金、单股/行业上限、止损风险和单股安全股数上限约束。
@@ -298,6 +321,8 @@ stage_rules:
   top_full_exit_drawdown_ratio: 0.03
   top_state_max_calendar_days: 45
   top_state_reset_drawdown_ratio: 0.20
+  # 已确认成交的顶部减仓，须在前次执行峰值之上出现新的有效高点后才可再次分批。
+  top_rearm_new_high_ratio: 0.03
 
 market_indices:
   - 000001.SH
@@ -352,6 +377,7 @@ portfolio:
       #     record_date: "2026-08-06"
       #     ex_date: "2026-08-07"
       #     cash_per_share: 2.06
+      #     eligible_shares: 900  # 股权登记日对应股数，不能用后续持仓反推
       #     basis_adjusted: false
       satellite:
         active: false

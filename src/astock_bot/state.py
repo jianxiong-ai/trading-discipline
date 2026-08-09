@@ -77,15 +77,55 @@ class StateStore:
         item = self.data.setdefault("sent", {}).get(event_id)
         return None if item is None else int(item.get("rank", 1))
 
+    @staticmethod
+    def _semantic_event_key(event_id: str, item: dict[str, Any] | None = None) -> str:
+        """Return the date-independent identity used for persistent signals.
+
+        Older state files did not persist ``semantic_key``; deriving it from the
+        legacy ``YYYY-MM-DD|...`` event id keeps the migration backwards
+        compatible.
+        """
+        if item and item.get("semantic_key"):
+            return str(item["semantic_key"])
+        return event_id.split("|", 1)[1] if "|" in event_id else event_id
+
+    def sent_rank_for_semantic_key(self, semantic_key: str) -> int | None:
+        ranks = [
+            int(item.get("rank", 1))
+            for event_id, item in self.data.setdefault("sent", {}).items()
+            if self._semantic_event_key(event_id, item) == semantic_key
+        ]
+        return max(ranks) if ranks else None
+
+    def clear_sent_semantic_key(self, semantic_key: str) -> None:
+        sent = self.data.setdefault("sent", {})
+        removed = [
+            event_id
+            for event_id, item in sent.items()
+            if self._semantic_event_key(event_id, item) == semantic_key
+        ]
+        if removed:
+            for event_id in removed:
+                del sent[event_id]
+            self._save()
+
     def count(self, day: date, category: str) -> int:
         prefix = day.isoformat()
         return sum(1 for item in self.data.setdefault("sent", {}).values() if item.get("date") == prefix and item.get("category") == category)
 
-    def mark_sent(self, event_id: str, day: date, category: str, rank: int = 1) -> None:
+    def mark_sent(
+        self,
+        event_id: str,
+        day: date,
+        category: str,
+        rank: int = 1,
+        semantic_key: str | None = None,
+    ) -> None:
         self.data.setdefault("sent", {})[event_id] = {
             "date": day.isoformat(),
             "category": category,
             "rank": int(rank),
+            **({"semantic_key": semantic_key} if semantic_key else {}),
         }
         self._save()
 
@@ -104,6 +144,22 @@ class StateStore:
 
     def ran(self, day: date, node: str) -> bool:
         return bool(self.data.setdefault("runs", {}).get(f"{day.isoformat()}|{node}"))
+
+    def claim_run(self, day: date, node: str) -> bool:
+        """Persist an at-most-once claim before an external notification call."""
+        key = f"{day.isoformat()}|{node}"
+        runs = self.data.setdefault("runs", {})
+        if runs.get(key):
+            return False
+        runs[key] = True
+        self._prune(day)
+        self._save()
+        return True
+
+    def release_run(self, day: date, node: str) -> None:
+        """Explicit administrative retry; scheduler keeps uncertain sends claimed."""
+        self.data.setdefault("runs", {}).pop(f"{day.isoformat()}|{node}", None)
+        self._save()
 
     def mark_ran(self, day: date, node: str) -> None:
         self.data.setdefault("runs", {})[f"{day.isoformat()}|{node}"] = True

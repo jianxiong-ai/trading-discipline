@@ -77,6 +77,32 @@ class SignalLifecycleTests(unittest.TestCase):
             self.assertIsNone(resolved)
             self.assertEqual(service.state.active_signal("601336.SH"), {})
 
+    def test_recorded_top_sell_advances_stage_only_after_holding_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = MonitorService.__new__(MonitorService)
+            service.state = StateStore(f"{directory}/state.json")
+            service.state.save_stage_state("600362.SH", {
+                "state": "STAGE_TOP_CONFIRMED",
+                "top_trim_stage": 0,
+                "top_executed_shares": 0,
+                "top_pending_anchor_shares": 1000,
+                "top_pending_shares": 200,
+                "top_pending_event_id": "2026-08-08|600362.SH:STAGE_TOP_EXIT:49.50",
+                "top_pending_price": 49.50,
+                "top_pending_peak": 50.00,
+            })
+            position = Position(
+                "600362.SH", "江西铜业", 800, 77820, "copper",
+                300, 500, (), SatellitePosition(),
+            )
+            memory = service._sync_stage_execution(
+                position, service.state.stage_state(position.symbol), date(2026, 8, 8), True,
+            )
+            self.assertEqual(memory["top_trim_stage"], 1)
+            self.assertEqual(memory["top_executed_shares"], 200)
+            self.assertEqual(memory["top_execution_peak"], 50.0)
+            self.assertIsNone(memory["top_pending_event_id"])
+
 
 if __name__ == "__main__":
     unittest.main()

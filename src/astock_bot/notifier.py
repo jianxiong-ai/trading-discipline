@@ -45,6 +45,8 @@ def render_message(
             )
             share_text = f" {signal.shares}股{weight_text}" if signal.shares > 0 else ""
             lines.append(f"建议：{signal.action}{share_text}")
+        if signal.details.get("pending_reminder"):
+            lines.append("状态：前次建议尚未确认成交，本次为待处理提醒")
         lines.append(f"原因：{signal.reason}")
         evidence = str(signal.details.get("evidence") or "").strip()
         if evidence and signal.code in {

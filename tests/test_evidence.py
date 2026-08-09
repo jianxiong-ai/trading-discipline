@@ -173,6 +173,34 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(classify_announcement_title("关于股东减持计划的公告"), ("caution", -1, 1))
         self.assertEqual(classify_announcement_title("2026年半年度业绩预增公告"), ("none", 0, 0))
 
+    def test_szse_structured_announcements_feed_the_same_risk_gate(self):
+        collector = OfficialEvidenceCollector("Asia/Shanghai", {
+            "announcements": {"lookback_calendar_days": 14, "max_pages": 2},
+            "corporate_actions": {"enabled": False},
+        })
+        requests = []
+
+        def post_json(url, payload, referer):
+            requests.append((url, payload, referer))
+            return {
+                "data": [{
+                    "title": "关于收到立案调查告知书的公告",
+                    "publishTime": "2026-08-07 18:00:00",
+                    "attachPath": "/disclosure/notice/002865_20260807.pdf",
+                }],
+                "announceCount": 1,
+            }
+
+        collector._post_json = post_json
+        items = collector._announcements("002865.SZ", datetime(2026, 8, 8, 10, 15, tzinfo=TZ))
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].source, "深圳证券交易所")
+        self.assertTrue(items[0].source_url.startswith("https://disc.static.szse.cn/"))
+        self.assertEqual(items[0].direction, -1)
+        self.assertEqual(requests[0][1]["stock"], ["002865"])
+        self.assertEqual(requests[0][1]["channelCode"], ["listedNotice_disc"])
+        self.assertEqual(requests[0][1]["seDate"], ["2026-07-25", "2026-08-08"])
+
     def test_corporate_action_title_is_narrow_and_lifecycle_aware(self):
         self.assertEqual(
             classify_corporate_action_title("关于董事长提议公司回购股份的公告"),

@@ -21,6 +21,9 @@ services:
     command: ["uvicorn", "astock_bot.web:app", "--host", "0.0.0.0", "--port", "8787"]
     environment:
       ASTOCK_CONFIG: /app/config.yaml
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-v4-flash}
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data

@@ -1,9 +1,42 @@
 {% extends "base.html" %}
 {% block content %}
-<section class="page-bar"><h1>观察仓与复盘</h1><span class="muted">满足首次建仓条件才会提醒</span></section>
-<section class="grid-two wide-left">
-  <article class="panel"><div class="section-head"><h2>观察标的</h2><span>{{ watchlist|length }}只</span></div><div class="table-wrap"><table><thead><tr><th>标的</th><th>行业</th><th>同行</th><th>产业证据</th><th></th></tr></thead><tbody>{% for p in watchlist %}<tr><td><b>{{ p.name }}</b><br><small>{{ p.symbol }}</small></td><td>{{ p.sector }}</td><td><small>{{ p.peers|join('、') or '未设置' }}</small></td><td><small>{% if p.sector == 'generic' %}仅观察，暂不启用首次建仓{% else %}已接入对应证据路由{% endif %}</small></td><td><form method="post" action="/watchlist/{{ p.symbol }}/remove"><button class="quiet danger" type="submit">移除</button></form></td></tr>{% else %}<tr><td colspan="5">暂无观察标的</td></tr>{% endfor %}</tbody></table></div></article>
-  <aside class="panel form-panel"><h2>加入观察仓</h2><form method="post" action="/watchlist" class="form-grid"><label>证券代码<input name="symbol" placeholder="例如 600487.SH" required></label><label>标的名称<input name="name" placeholder="例如 亨通光电" required></label><label>行业<select name="sector">{% for sector in supported_sectors %}<option value="{{ sector }}">{{ sector }}</option>{% endfor %}</select></label><label class="full">同行代码<input name="peers" placeholder="可选，逗号分隔，例如 601899.SH,000630.SZ"></label><button class="full" type="submit">加入观察仓</button></form></aside>
+<section class="page-title"><div><p class="eyebrow">UNIVERSE</p><h1>股票池</h1><p>输入代码，自动建立行业、同行与研究证据档案。</p></div><span class="count">{{ watchlist|length }} 只观察标的</span></section>
+
+<section class="onboarding-panel">
+  <div><p class="eyebrow">SMART ONBOARDING</p><h2>加入一只股票</h2><p>规则引擎先识别；LLM 只做可选复核，不产生买卖建议。</p></div>
+  <form method="post" action="/watchlist" class="onboarding-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label class="symbol-input"><span>证券代码</span><input name="symbol" placeholder="例如 600487.SH" autocomplete="off" required></label>
+    <label class="check"><input type="checkbox" name="use_llm" {% if not llm_available %}disabled{% endif %}><span>使用 LLM 复核{% if llm_available %} · {{ llm_model }}{% else %} · 未配置{% endif %}</span></label>
+    <button type="submit">识别并加入</button>
+    <details class="advanced full"><summary>识别失败或需要覆盖时，手动补充</summary><div class="form-grid compact"><label>名称<input name="name" placeholder="可选"></label><label>行业<select name="sector"><option value="">自动识别</option>{% for item in sector_options %}<option value="{{ item.key }}">{{ item.label }}</option>{% endfor %}</select></label><label class="full">同行代码<input name="peers" placeholder="可选，逗号分隔"></label></div></details>
+  </form>
 </section>
-<section class="panel"><div class="section-head"><h2>最近复盘</h2><span>正式节点与15:30总结</span></div><div class="audit-list">{% for record in audit_records[:12] %}<details class="audit"><summary><b>{{ record.timestamp[:16].replace('T', ' ') }}</b><span>{{ record.node }} · {{ record.decision }}</span><small>{{ record.signals|length }}个信号</small></summary>{% if record.summaries %}{% for row in record.summaries %}<div class="summary-row"><b>{{ row.name }}</b><span>{{ row.recommendation }}</span><small>{{ row.reason }}</small></div>{% endfor %}{% elif record.signals %}{% for signal in record.signals %}<div class="summary-row"><b>{{ signal.name }}</b><span>{{ signal.action }}{% if signal.shares %} {{ signal.shares }}股{% endif %}</span><small>{{ signal.reason }}</small></div>{% endfor %}{% else %}<p class="empty">无操作建议</p>{% endif %}</details>{% else %}<p class="empty">暂无复盘记录</p>{% endfor %}</div></section>
+
+<section class="panel stock-pool">
+  <div class="section-head"><div><p class="eyebrow">TRACKING</p><h2>观察标的</h2></div><span>完整跟踪才会评估首次建仓</span></div>
+  <div class="card-list">
+  {% for p in watchlist %}
+    {% set profile = p.analysis_profile or {} %}
+    <details class="stock-card">
+      <summary>
+        <div class="security"><span class="avatar">{{ p.name[:1] }}</span><div><strong>{{ p.name }}</strong><small>{{ p.symbol }}</small></div></div>
+        <div class="sector"><strong>{{ profile.sector_label or p.sector }}</strong><small>{{ profile.source_industry or '行业资料待补充' }}</small></div>
+        <span class="badge {{ 'ok' if (profile.coverage == 'full' or (not profile and p.sector != 'generic')) else 'muted-badge' }}">{{ profile.coverage_label or ('完整跟踪' if p.sector != 'generic' else '基础跟踪') }}</span>
+        <span class="expand">查看</span>
+      </summary>
+      <div class="profile-grid">
+        <div><span>分析边界</span><p>{{ profile.signal_policy or ('产业与技术证据通过后评估首次建仓' if p.sector != 'generic' else '产业证据待补充，暂不触发首次建仓') }}</p></div>
+        <div><span>证据路由</span><p>{{ profile.evidence_route or p.sector }}</p></div>
+        <div><span>业务与驱动</span><p>{{ profile.business_summary or '暂无自动公司摘要' }}</p>{% if profile.drivers %}<small>{{ profile.drivers|join(' · ') }}</small>{% endif %}</div>
+        <div><span>主要风险</span><p>{{ profile.risks|join(' · ') if profile.risks else '随正式节点更新' }}</p></div>
+        <div><span>同行</span><p>{{ p.peers|join('、') or '同行样本待补充' }}</p></div>
+        <div><span>档案来源</span><p>{{ profile.classification_label or '配置导入' }}{% if profile.confidence %} · {{ profile.confidence }}{% endif %}</p><small>{{ profile.profile_source or '本地配置' }}{% if profile.profile_as_of %} · {{ profile.profile_as_of }}{% endif %}</small></div>
+      </div>
+      <form method="post" action="/watchlist/{{ p.symbol }}/remove" class="remove-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="quiet danger" type="submit">移出股票池</button></form>
+    </details>
+  {% else %}<p class="empty">暂无观察标的。输入一只代码开始跟踪。</p>{% endfor %}
+  </div>
+</section>
+
+<section class="panel review-panel"><div class="section-head"><div><p class="eyebrow">REVIEW</p><h2>最近复盘</h2></div><span>正式节点与 15:30 总结</span></div><div class="audit-list">{% for record in audit_records[:8] %}<details class="audit"><summary><b>{{ record.timestamp[:16].replace('T', ' ') }}</b><span>{{ record.node }} · {{ record.decision }}</span><small>{{ record.review_count }}只标的{% if record.signal_count %} · {{ record.signal_count }}个建议{% endif %}</small></summary>{% if record.review_rows %}{% for row in record.review_rows %}<div class="brief"><strong>{{ row.name }} <small>{{ row.symbol }}{% if row.price is not none %} · {{ '{:.2f}'.format(row.price) }}{% endif %}{% if row.change_pct is not none %} · {{ '{:+.2f}%'.format(row.change_pct) }}{% endif %}</small></strong><span>{{ row.recommendation }}</span><p>{{ row.reason }}</p></div>{% endfor %}{% else %}<p class="empty">该节点未生成逐标的复盘数据。</p>{% endif %}</details>{% else %}<p class="empty">暂无复盘记录。</p>{% endfor %}</div></section>
 {% endblock %}
