@@ -6,6 +6,7 @@ services:
       ASTOCK_CONFIG: /app/config.yaml
       FEISHU_WEBHOOK: ${FEISHU_WEBHOOK:-}
       FEISHU_SECRET: ${FEISHU_SECRET:-}
+      NOTIFICATION_ENCRYPTION_KEY: ${NOTIFICATION_ENCRYPTION_KEY:-}
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data
@@ -21,9 +22,12 @@ services:
     command: ["uvicorn", "astock_bot.web:app", "--host", "0.0.0.0", "--port", "8787"]
     environment:
       ASTOCK_CONFIG: /app/config.yaml
+      FEISHU_WEBHOOK: ${FEISHU_WEBHOOK:-}
+      FEISHU_SECRET: ${FEISHU_SECRET:-}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
       LLM_MODEL: ${LLM_MODEL:-deepseek-v4-flash}
+      NOTIFICATION_ENCRYPTION_KEY: ${NOTIFICATION_ENCRYPTION_KEY:-}
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data

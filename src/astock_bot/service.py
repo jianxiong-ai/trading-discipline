@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +14,7 @@ from .evidence import OfficialEvidenceCollector
 from .indicators import compute_daily_levels, compute_technicals
 from .models import Signal
 from .notifier import FeishuNotifier, render_daily_summary, render_message
+from .portfolio_store import PortfolioStore
 from .state import StateStore
 from .strategy import evaluate_position, overheat_watch_signal
 
@@ -185,9 +187,76 @@ class MonitorService:
         self.state = StateStore(str(config.raw.get("state_file", "/app/data/state.json")))
         notify = config.section("notification")
         self.notifier = FeishuNotifier(str(notify.get("webhook", "")), str(notify.get("secret", "")))
+        self.portfolio_store = PortfolioStore.from_config(
+            Path(os.getenv("ASTOCK_CONFIG", "config.yaml")), config.raw
+        )
         self.evidence_char_limit = int(notify.get("evidence_char_limit", 240))
         self.margin_char_limit = int(notify.get("margin_char_limit", 120))
         self.tz = ZoneInfo(config.timezone)
+
+    @staticmethod
+    def _confidence_rank(value: str) -> int:
+        return {"低": 1, "中": 2, "高": 3}.get(str(value), 0)
+
+    @staticmethod
+    def _critical_signal(signal: Signal) -> bool:
+        return signal.category == "risk" or signal.code in {"EMERGENCY_RISK", "STAGE_TOP_EXIT"}
+
+    def _notification_targets(self) -> list[dict]:
+        """Return the workspace's one all-portfolio Feishu destination."""
+        if self.portfolio_store is not None:
+            settings = self.portfolio_store.notification_settings(self.config.raw, include_secrets=True)
+            if settings.get("webhook") and not settings.get("unreadable"):
+                return [{
+                    "id": int(settings["id"]), "name": "默认通知",
+                    "webhook": settings["webhook"], "secret": settings.get("secret", ""),
+                    "min_confidence": settings.get("min_confidence", "中"),
+                }]
+        notification = self.config.section("notification")
+        if bool(self.config.raw.get("_workspace_seed_static", True)) and str(notification.get("webhook", "")).strip():
+            return [{
+                "id": None, "name": "默认通知（兼容）", "webhook": str(notification.get("webhook", "")),
+                "secret": str(notification.get("secret", "")), "min_confidence": "中",
+            }]
+        return []
+
+    def _target_accepts_signal(self, target: dict, signal: Signal) -> bool:
+        # Every configured workspace receives its entire portfolio and watchlist.
+        # The confidence threshold is intentionally the only routing rule.
+        return self._confidence_rank(signal.confidence) >= self._confidence_rank(target.get("min_confidence", "中"))
+
+    def _route_action_signals(self, signals: list[Signal]) -> dict[int | None, tuple[dict, list[Signal]]]:
+        routed: dict[int | None, tuple[dict, list[Signal]]] = {}
+        for target in self._notification_targets():
+            matched = [signal for signal in signals if self._target_accepts_signal(target, signal)]
+            if matched:
+                routed[target.get("id")] = (target, matched)
+        return routed
+
+    def _target_accepts_summary_row(self, target: dict, row: dict) -> bool:
+        return bool(target.get("webhook"))
+
+    def _delivery_claimed(self, target: dict, key: str, kind: str) -> bool:
+        if target.get("id") is None or self.portfolio_store is None:
+            return False
+        return self.portfolio_store.notification_setting_delivery_claimed(key, kind)
+
+    def _send_target(self, target: dict, key: str, kind: str, message: str) -> bool:
+        if target.get("id") is not None and self.portfolio_store is not None:
+            # Claim before the external call: a client timeout may still mean
+            # Feishu accepted the message, so silently retrying would duplicate it.
+            if self._delivery_claimed(target, key, kind):
+                return False
+            self.portfolio_store.mark_notification_setting_delivery(key, kind, "claimed", message)
+        try:
+            FeishuNotifier(str(target["webhook"]), str(target.get("secret", ""))).send(message)
+        except Exception as exc:
+            if target.get("id") is not None and self.portfolio_store is not None:
+                self.portfolio_store.mark_notification_setting_delivery(key, kind, "uncertain", message, str(exc))
+            raise
+        if target.get("id") is not None and self.portfolio_store is not None:
+            self.portfolio_store.mark_notification_setting_delivery(key, kind, "sent", message)
+        return True
 
     def run_node(
         self,
@@ -536,33 +605,40 @@ class MonitorService:
         selected, selection_suppressed = self._rank_capital_entries(signals)
         sendable, notification_suppressed = self._filter_sendable(selected, now)
         suppressed = [*selection_suppressed, *notification_suppressed]
-        sent_ids = {signal.event_id for signal in sendable}
+        routed = self._route_action_signals(sendable) if not dry_run else {}
+        sent_ids: set[str] = set()
         suppressed_by_id = {item["event_id"]: item["reason"] for item in suppressed}
         for signal in signals:
-            if signal.event_id in sent_ids:
-                signal.details["notification_status"] = "would_send" if dry_run else "sent"
+            if signal.event_id in {item.event_id for item in sendable}:
+                signal.details["notification_status"] = "would_send" if dry_run else (
+                    "routed" if routed else "no_subscriber"
+                )
             elif signal.event_id in suppressed_by_id:
                 signal.details["notification_status"] = "suppressed"
                 signal.details["suppression_reason"] = suppressed_by_id[signal.event_id]
             else:
                 signal.details["notification_status"] = "candidate"
-        if sendable and not dry_run:
+        delivered: list[Signal] = []
+        if sendable and not dry_run and routed:
             title = str(self.config.section("notification").get("title", "A股持仓纪律"))
-            try:
-                self.notifier.send(
-                    render_message(
-                        sendable,
-                        node,
-                        title,
-                        self.evidence_char_limit,
-                        self.margin_char_limit,
-                    )
+            for target, target_signals in routed.values():
+                message = render_message(
+                    target_signals, node, title,
+                    self.evidence_char_limit, self.margin_char_limit,
                 )
-            except Exception as exc:
-                failure = self._result(node, "ERROR", sendable, [*warnings, f"飞书发送失败: {exc}"], summaries)
-                self._append_log(failure, now, execution_type)
-                raise
+                delivery_key = ";".join(sorted(signal.event_id for signal in target_signals))
+                try:
+                    if self._send_target(target, delivery_key, "action", message):
+                        delivered.extend(target_signals)
+                except Exception as exc:
+                    warnings.append(f"{target.get('name', '机器人')} 飞书发送失败: {exc}")
+            sent_ids = {signal.event_id for signal in delivered}
+            for signal in signals:
+                if signal.event_id in sent_ids:
+                    signal.details["notification_status"] = "sent"
             for signal in sendable:
+                if signal.event_id not in sent_ids:
+                    continue
                 self.state.mark_sent(
                     signal.event_id,
                     now.date(),
@@ -578,27 +654,17 @@ class MonitorService:
                 now.date(),
                 {
                     signal.category
-                    for signal in sendable
+                    for signal in delivered
                     if signal.category in {"strategy", "satellite", "reminder"}
                 },
             )
-        elif (
-            not sendable
-            and not dry_run
-            and bool(self.config.section("notification").get("send_no_alert", False))
-        ):
-            title = str(self.config.section("notification").get("title", "A股持仓纪律"))
-            try:
-                self.notifier.send(f"【{title}｜{node}】本节点无操作建议。")
-            except Exception as exc:
-                warnings.append(f"飞书发送失败: {exc}")
         result = self._result(
             node,
-            "ALERT" if sendable else "NO_ALERT",
+            "ALERT" if delivered or dry_run and sendable else "NO_ALERT",
             signals,
             warnings,
             summaries,
-            sent_signals=sendable,
+            sent_signals=delivered if not dry_run else sendable,
             suppressed=suppressed,
         )
         self._append_log(result, now, execution_type)
@@ -608,6 +674,10 @@ class MonitorService:
         now = now or datetime.now(self.tz)
         if now.weekday() >= 5 or now.date().isoformat() in self.config.holidays:
             return self._result("15:30", "NO_SUMMARY", [], ["休市日"])
+        dividend_settlements: list[dict] = []
+        dividend_warnings: list[str] = []
+        if not dry_run:
+            dividend_settlements, dividend_warnings = self._sync_auto_dividends(now)
         records = self._formal_records_for_day(now)
         rows = self._daily_summary_rows(records)
         nodes = list(self.config.schedule)
@@ -619,15 +689,17 @@ class MonitorService:
             for warning in record.get("warnings", [])
             if warning
         ]
+        warnings.extend(dividend_warnings)
         if missing_nodes:
             warnings.append("缺少正式节点：" + "、".join(missing_nodes))
         title = str(self.config.section("notification").get("title", "A股持仓纪律"))
+        ledger_notes = [
+            f"自动分红入账：{item['name']} ¥{float(item['amount']):.2f}（发放日 {item['payment_date']}）"
+            for item in dividend_settlements
+            if item.get("status") == "settled"
+        ]
         message = render_daily_summary(
-            rows,
-            nodes,
-            now.date().isoformat(),
-            title,
-            warnings,
+            rows, nodes, now.date().isoformat(), title, warnings, ledger_notes,
         )
         result = {
             "node": "15:30",
@@ -636,16 +708,55 @@ class MonitorService:
             "summaries": rows,
             "warnings": warnings,
             "source_nodes": [record.get("node") for record in records],
+            "dividend_settlements": dividend_settlements,
         }
         if not dry_run:
-            try:
-                self.notifier.send(message)
-            except Exception as exc:
-                failure = {**result, "decision": "ERROR", "warnings": [*warnings, f"飞书发送失败: {exc}"]}
-                self._append_log(failure, now, "summary")
-                raise
+            targets = self._notification_targets()
+            delivered_to = 0
+            for target in targets:
+                filtered_rows = [row for row in rows if self._target_accepts_summary_row(target, row)]
+                if not filtered_rows:
+                    continue
+                target_message = render_daily_summary(
+                    filtered_rows, nodes, now.date().isoformat(), title, warnings, ledger_notes,
+                )
+                try:
+                    if self._send_target(target, now.date().isoformat(), "summary", target_message):
+                        delivered_to += 1
+                except Exception as exc:
+                    warnings.append(f"{target.get('name', '机器人')} 飞书总结发送失败: {exc}")
+            result["destination_count"] = delivered_to
+            if targets and not delivered_to:
+                result["decision"] = "SUMMARY_NOT_DELIVERED"
         self._append_log(result, now, "summary_dry_run" if dry_run else "summary")
         return {**result, "message": message}
+
+    def _sync_auto_dividends(self, now: datetime) -> tuple[list[dict], list[str]]:
+        """Settle only fully verified implementation notices after the session."""
+        if self.portfolio_store is None:
+            return [], []
+        evidence_config = self.config.section("evidence")
+        if not bool(evidence_config.get("enabled", False)):
+            return [], []
+        dividend_settings = dict(evidence_config.get("dividends", {}) or {})
+        if not bool(dividend_settings.get("enabled", True)):
+            return [], []
+        collector_config = dict(evidence_config)
+        collector = OfficialEvidenceCollector(self.config.timezone, collector_config)
+        events_by_symbol, warnings = collector.collect_cash_dividend_events(
+            self.config.positions, now,
+        )
+        names = {position.symbol: position.name for position in self.config.positions}
+        outcomes: list[dict] = []
+        for symbol, events in events_by_symbol.items():
+            try:
+                for outcome in self.portfolio_store.sync_auto_dividends(
+                    symbol=symbol, events=events, as_of=now.date().isoformat(),
+                ):
+                    outcomes.append({**outcome, "name": names.get(symbol, symbol)})
+            except Exception as exc:
+                warnings.append(f"{symbol} 自动分红登记未完成: {exc}")
+        return outcomes, warnings
 
     def _formal_records_for_day(self, now: datetime) -> list[dict]:
         path = Path(str(self.config.raw.get("log_file", "/app/data/events.jsonl")))
@@ -1206,7 +1317,10 @@ class MonitorService:
     def _append_log(self, result: dict, now: datetime, execution_type: str) -> None:
         path = Path(str(self.config.raw.get("log_file", "/app/data/events.jsonl")))
         path.parent.mkdir(parents=True, exist_ok=True)
-        record = {"timestamp": now.isoformat(), "execution_type": execution_type, **result}
+        record = {
+            "timestamp": now.isoformat(), "workspace_id": self.config.workspace_id,
+            "execution_type": execution_type, **result,
+        }
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 

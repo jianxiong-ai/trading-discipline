@@ -27,10 +27,14 @@ SSE_ANNOUNCEMENT_URL = "https://query.sse.com.cn/security/stock/queryCompanyBull
 SZSE_ANNOUNCEMENT_URL = "https://www.szse.cn/api/disc/announcement/annList"
 SSE_MARGIN_URL = "https://query.sse.com.cn/commonSoaQuery.do"
 SZSE_MARGIN_URL = "https://www.szse.cn/api/report/ShowReport/data"
-# push2 在部分网络会被掐连接；delay 节点更稳，历史序列靠本地滚动缓存补齐。
-EASTMONEY_FFLOW_URL = (
-    "https://push2delay.eastmoney.com/api/qt/stock/fflow/daykline/get"
+# 东方财富原 daykline 路径已逐步返回 rc=100/空 K 线。优先使用仍有数据的
+# kline 路径，并在不同节点间回退；本地滚动缓存负责补齐日终历史序列。
+EASTMONEY_FFLOW_URLS = (
+    "https://push2delay.eastmoney.com/api/qt/stock/fflow/kline/get",
+    "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get",
+    "https://push2his.eastmoney.com/api/qt/stock/fflow/kline/get",
 )
+EASTMONEY_FFLOW_UT = "fa5fd1943c7b386f172d6893dbfba10b"
 EASTMONEY_HOLDER_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 SHFE_DAILY_URL = "https://www.shfe.com.cn/data/tradedata/future/dailydata/kx{date}.dat"
 SHFE_WARRANT_URLS = (
@@ -792,56 +796,11 @@ class OfficialEvidenceCollector:
             days=int(action_settings.get("sse_archive_lookahead_days", 1))
             if action_enabled else 0
         )
-        rows: list[dict[str, Any]] = []
         max_pages = max(int(settings.get("max_pages", 5)), 1)
         exchange = "上海证券交易所" if symbol.endswith(".SH") else "深圳证券交易所"
-        if symbol.endswith(".SH"):
-            params = {
-                "isPagination": "true", "productId": code, "keyWord": "",
-                "securityType": "0101,120100,020100,020200,120200",
-                "reportType2": "", "reportType": "ALL", "beginDate": begin.isoformat(),
-                "endDate": query_end.isoformat(), "pageHelp.pageSize": 25,
-                "pageHelp.pageNo": 1, "pageHelp.beginPage": 1,
-                "pageHelp.cacheSize": 1, "pageHelp.endPage": 1,
-            }
-            for page_no in range(1, max_pages + 1):
-                params.update({"pageHelp.pageNo": page_no, "pageHelp.beginPage": page_no, "pageHelp.endPage": page_no})
-                payload = self._get_json(f"{SSE_ANNOUNCEMENT_URL}?{urlencode(params)}", "https://www.sse.com.cn/assortment/stock/list/info/announcement/")
-                page_help = payload.get("pageHelp") or {}
-                page_rows = page_help.get("data") or payload.get("result") or []
-                rows.extend(page_rows)
-                if page_no >= int(page_help.get("pageCount") or 1) or not page_rows:
-                    break
-        elif symbol.endswith(".SZ"):
-            # The live SZSE page now posts JSON to annList.  The older GET
-            # shape (channelCode=fixed_disc/secCode/seDate=range) returns 500
-            # in production even though the endpoint path still exists.
-            page_size = 50
-            for page_no in range(1, max_pages + 1):
-                payload = self._post_json(
-                    f"{SZSE_ANNOUNCEMENT_URL}?random=0.5",
-                    {
-                        "stock": [code],
-                        "channelCode": ["listedNotice_disc"],
-                        "seDate": [begin.isoformat(), query_end.isoformat()],
-                        "pageSize": page_size,
-                        "pageNum": page_no,
-                    },
-                    "https://www.szse.cn/disclosure/listed/notice/index.html",
-                )
-                page_rows = payload.get("data") or []
-                rows.extend(page_rows)
-                total_count = int(payload.get("announceCount") or 0)
-                if (
-                    not page_rows
-                    or len(page_rows) < page_size
-                    or (total_count and len(rows) >= total_count)
-                ):
-                    break
-        else:
-            raise EvidenceSourceError("不支持的交易所代码")
         critical = tuple(settings.get("critical_keywords", DEFAULT_CRITICAL_KEYWORDS))
         caution = tuple(settings.get("caution_keywords", DEFAULT_CAUTION_KEYWORDS))
+        rows = self._announcement_rows(symbol, begin, query_end, max_pages)
         result: list[EvidenceItem] = []
         operating_keywords = tuple(settings.get(
             "operating_keywords",
@@ -924,6 +883,149 @@ class OfficialEvidenceCollector:
         if action_item is not None:
             result.append(action_item)
         return sorted(result, key=lambda item: item.observed_at, reverse=True)
+
+    def _announcement_rows(
+        self,
+        symbol: str,
+        begin: date,
+        query_end: date,
+        max_pages: int,
+    ) -> list[dict[str, Any]]:
+        """Read the exchange announcement ledger without inferring any facts."""
+        code = symbol.split(".")[0]
+        rows: list[dict[str, Any]] = []
+        if symbol.endswith(".SH"):
+            params = {
+                "isPagination": "true", "productId": code, "keyWord": "",
+                "securityType": "0101,120100,020100,020200,120200",
+                "reportType2": "", "reportType": "ALL", "beginDate": begin.isoformat(),
+                "endDate": query_end.isoformat(), "pageHelp.pageSize": 25,
+                "pageHelp.pageNo": 1, "pageHelp.beginPage": 1,
+                "pageHelp.cacheSize": 1, "pageHelp.endPage": 1,
+            }
+            for page_no in range(1, max_pages + 1):
+                params.update({"pageHelp.pageNo": page_no, "pageHelp.beginPage": page_no, "pageHelp.endPage": page_no})
+                payload = self._get_json(f"{SSE_ANNOUNCEMENT_URL}?{urlencode(params)}", "https://www.sse.com.cn/assortment/stock/list/info/announcement/")
+                page_help = payload.get("pageHelp") or {}
+                page_rows = page_help.get("data") or payload.get("result") or []
+                rows.extend(page_rows)
+                if page_no >= int(page_help.get("pageCount") or 1) or not page_rows:
+                    break
+        elif symbol.endswith(".SZ"):
+            # The live SZSE page now posts JSON to annList.  The older GET
+            # shape (channelCode=fixed_disc/secCode/seDate=range) returns 500
+            # in production even though the endpoint path still exists.
+            page_size = 50
+            for page_no in range(1, max_pages + 1):
+                payload = self._post_json(
+                    f"{SZSE_ANNOUNCEMENT_URL}?random=0.5",
+                    {
+                        "stock": [code],
+                        "channelCode": ["listedNotice_disc"],
+                        "seDate": [begin.isoformat(), query_end.isoformat()],
+                        "pageSize": page_size,
+                        "pageNum": page_no,
+                    },
+                    "https://www.szse.cn/disclosure/listed/notice/index.html",
+                )
+                page_rows = payload.get("data") or []
+                rows.extend(page_rows)
+                total_count = int(payload.get("announceCount") or 0)
+                if (
+                    not page_rows
+                    or len(page_rows) < page_size
+                    or (total_count and len(rows) >= total_count)
+                ):
+                    break
+        else:
+            raise EvidenceSourceError("不支持的交易所代码")
+        return rows
+
+    def collect_cash_dividend_events(
+        self,
+        positions: tuple[Position, ...],
+        as_of: datetime,
+    ) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
+        """Return only fully verified cash-dividend implementation notices.
+
+        A board proposal or a title-only match is never enough to move cash.  The
+        exchange-hosted PDF must explicitly contain the record date, ex-dividend
+        date, payment date and a positive per-share cash amount.
+        """
+        settings = dict(self.config.get("dividends", {}) or {})
+        if not bool(settings.get("enabled", True)):
+            return {}, []
+        lookback = max(int(settings.get("lookback_calendar_days", 180)), 30)
+        max_pages = max(int(settings.get("max_pages", 12)), 1)
+        max_documents = max(int(settings.get("max_documents_per_symbol", 4)), 1)
+        max_pdf_pages = max(int(settings.get("max_pdf_pages", 12)), 1)
+        events: dict[str, list[dict[str, Any]]] = {}
+        warnings: list[str] = []
+        for position in positions:
+            if position.role != "holding" or position.total_shares <= 0 or _is_etf(position):
+                continue
+            try:
+                rows = self._announcement_rows(
+                    position.symbol,
+                    as_of.date() - timedelta(days=lookback),
+                    as_of.date(),
+                    max_pages,
+                )
+            except Exception as exc:
+                warnings.append(f"{position.symbol} 分红公告读取失败: {exc}")
+                continue
+            found: dict[str, dict[str, Any]] = {}
+            parsed = 0
+            for row in rows:
+                title = _clean_text(str(row.get("TITLE") or row.get("title") or ""))
+                if not _is_cash_dividend_implementation_title(title):
+                    continue
+                try:
+                    published_at = _parse_announcement_datetime(row, self.tz)
+                except EvidenceSourceError:
+                    continue
+                if published_at > as_of or parsed >= max_documents:
+                    continue
+                relative_url = str(
+                    row.get("URL") or row.get("attachPath") or row.get("adjunctUrl") or ""
+                ).replace("\\/", "/")
+                base_url = (
+                    "https://www.sse.com.cn"
+                    if position.symbol.endswith(".SH")
+                    else "https://disc.static.szse.cn"
+                )
+                source_url = (
+                    relative_url
+                    if relative_url.startswith("http")
+                    else urljoin(base_url + "/", relative_url.lstrip("/"))
+                )
+                if not source_url.lower().endswith(".pdf"):
+                    continue
+                parsed += 1
+                try:
+                    terms = parse_cash_dividend_implementation(
+                        self._pdf_text(source_url, max_pdf_pages)
+                    )
+                except Exception:
+                    # Missing/unclear terms must remain absent rather than be
+                    # guessed from an announcement title.
+                    continue
+                event = {
+                    "type": "cash_dividend",
+                    **terms,
+                    "auto_discovered": True,
+                    "source_url": source_url,
+                    "announcement_title": title,
+                    "announced_at": published_at.isoformat(),
+                    "note": "交易所实施公告自动识别",
+                }
+                key = _cash_dividend_key(event)
+                found[key] = event
+            if found:
+                events[position.symbol] = sorted(
+                    found.values(), key=lambda item: (item["payment_date"], item["record_date"])
+                )
+        return events, warnings
 
     def _corporate_action_item(
         self,
@@ -1171,7 +1273,12 @@ class OfficialEvidenceCollector:
                 strength=0,
                 summary=(
                     f"盘中主力净流入暂值{main_net / 1e8:+.2f}亿元"
-                    f"（占换手{main_pct:+.2f}%）；未收盘，不参与新增、减仓或择优门控"
+                    + (
+                        f"（占换手{main_pct:+.2f}%）"
+                        if main_pct is not None
+                        else ""
+                    )
+                    + "；未收盘，不参与新增、减仓或择优门控"
                 ),
                 freshness="partial",
                 fact_type="capital_flow_intraday_partial",
@@ -1224,7 +1331,8 @@ class OfficialEvidenceCollector:
             strength=2 if signal.startswith("persistent") else (1 if direction else 0),
             summary=(
                 f"资金日终：主力净流入当日{main_net / 1e8:+.2f}亿元"
-                f"（占换手{main_pct:+.2f}%），{sample_note}"
+                + (f"（占换手{main_pct:+.2f}%）" if main_pct is not None else "")
+                + f"，{sample_note}"
                 f"（{observed_date.isoformat()}）"
             ),
             freshness=freshness,
@@ -1232,28 +1340,41 @@ class OfficialEvidenceCollector:
         )
         return item, signal, net_sum
 
-    def _fetch_today_main_flow(self, symbol: str) -> tuple[date, float, float]:
+    def _fetch_today_main_flow(self, symbol: str) -> tuple[date, float, float | None]:
         code = symbol.split(".")[0]
         market = "1" if symbol.endswith(".SH") else "0"
         params = {
-            "lmt": "1",
+            "lmt": "5",
             "klt": "101",
             "secid": f"{market}.{code}",
             "fields1": "f1,f2,f3,f7",
             "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
+            "ut": EASTMONEY_FFLOW_UT,
         }
-        url = f"{EASTMONEY_FFLOW_URL}?{urlencode(params)}"
-        payload = self._get_json(url, f"https://data.eastmoney.com/zjlx/{code}.html")
-        klines = ((payload.get("data") or {}) or {}).get("klines") or []
-        if not klines:
-            raise EvidenceSourceError("资金流向K线为空")
-        parts = str(klines[-1]).split(",")
-        if len(parts) < 7:
-            raise EvidenceSourceError("资金流向字段不足")
-        observed = date.fromisoformat(parts[0][:10])
-        main_net = float(parts[1])
-        main_pct = float(parts[6])
-        return observed, main_net, main_pct
+        referer = f"https://data.eastmoney.com/zjlx/{code}.html"
+        errors: list[str] = []
+        for endpoint in EASTMONEY_FFLOW_URLS:
+            try:
+                url = f"{endpoint}?{urlencode(params)}"
+                payload = self._get_json(url, referer)
+                klines = ((payload.get("data") or {}) or {}).get("klines") or []
+                if not klines:
+                    rc = payload.get("rc")
+                    errors.append(f"{endpoint.split('/')[2]} 空数据(rc={rc})")
+                    continue
+                parts = str(klines[-1]).split(",")
+                if len(parts) < 2:
+                    errors.append(f"{endpoint.split('/')[2]} 字段不足")
+                    continue
+                observed = date.fromisoformat(parts[0][:10])
+                main_net = float(parts[1])
+                # 新版 kline 响应仅返回日期和五档净流入，不再提供换手占比。
+                main_pct = float(parts[6]) if len(parts) > 6 else None
+                return observed, main_net, main_pct
+            except (TypeError, ValueError, EvidenceSourceError) as exc:
+                errors.append(f"{endpoint.split('/')[2]} {str(exc)[:80]}")
+        detail = "；".join(errors[-3:]) or "未返回可解析响应"
+        raise EvidenceSourceError(f"资金流向数据不可用：{detail}")
 
     def _fflow_history_path(self, symbol: str) -> Path | None:
         if self.cache_dir is None:
@@ -2065,6 +2186,96 @@ def _company_summary(items: list[EvidenceItem]) -> str:
 
 def _clean_text(value: str) -> str:
     return re.sub(r"\s+", " ", unescape(value)).strip()
+
+
+def _is_cash_dividend_implementation_title(title: str) -> bool:
+    clean = _clean_text(title)
+    if "实施" not in clean:
+        return False
+    if any(word in clean for word in ("预案", "提议", "董事会", "股东大会", "终止")):
+        return False
+    return any(word in clean for word in ("权益分派", "利润分配", "现金红利", "分红派息"))
+
+
+def _cash_dividend_key(event: dict[str, Any]) -> str:
+    return "|".join((
+        str(event.get("record_date", "")),
+        str(event.get("ex_date", "")),
+        f"{float(event.get('cash_per_share', 0) or 0):.6f}",
+    ))
+
+
+def _parse_cn_date(value: str) -> date | None:
+    clean = _clean_text(value).replace("年", "-").replace("月", "-").replace("日", "")
+    match = re.search(r"(20\d{2})\s*[-/]\s*(\d{1,2})\s*[-/]\s*(\d{1,2})", clean)
+    if not match:
+        return None
+    try:
+        return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    except ValueError:
+        return None
+
+
+def _dividend_date_after(text: str, labels: tuple[str, ...]) -> date | None:
+    for label in labels:
+        match = re.search(
+            rf"{re.escape(label)}\s*(?:为|是|：|:)?\s*"
+            r"(20\d{2}\s*(?:年|[-/])\s*\d{1,2}\s*(?:月|[-/])\s*\d{1,2}\s*日?)",
+            text,
+        )
+        if match:
+            parsed = _parse_cn_date(match.group(1))
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def parse_cash_dividend_implementation(text: str) -> dict[str, Any]:
+    """Parse settlement terms from an exchange-hosted implementation notice.
+
+    The parser is intentionally strict: all three dates and the per-share cash
+    term have to be explicit.  This is a bookkeeping parser, not a prediction
+    model, so ambiguous documents simply yield no event.
+    """
+    clean = _clean_text(text).replace("（", "(").replace("）", ")")
+    record_date = _dividend_date_after(clean, ("股权登记日",))
+    ex_date = _dividend_date_after(clean, ("除权(息)日", "除权除息日", "除息日", "除权日"))
+    payment_date = _dividend_date_after(
+        clean,
+        ("现金红利发放日", "现金股利发放日", "红利发放日", "派息日"),
+    )
+    cash_per_share: float | None = None
+    per_ten = re.search(
+        r"每\s*10\s*股(?:派发|派送|派现|分配)\s*(?:现金红利|现金股利|现金)?(?:人民币)?\s*"
+        r"([0-9]+(?:\.[0-9]+)?)\s*元",
+        clean,
+    )
+    if per_ten:
+        cash_per_share = float(per_ten.group(1)) / 10
+    else:
+        per_share = re.search(
+            r"每\s*股(?:派发|派送|派现|分配)?\s*(?:现金红利|现金股利|现金)?(?:人民币)?\s*"
+            r"([0-9]+(?:\.[0-9]+)?)\s*元",
+            clean,
+        )
+        if per_share:
+            cash_per_share = float(per_share.group(1))
+    if (
+        record_date is None
+        or ex_date is None
+        or payment_date is None
+        or cash_per_share is None
+        or cash_per_share <= 0
+        or ex_date < record_date
+        or payment_date < ex_date
+    ):
+        raise EvidenceSourceError("分红实施公告缺少可核验的日期或每股现金额")
+    return {
+        "record_date": record_date.isoformat(),
+        "ex_date": ex_date.isoformat(),
+        "payment_date": payment_date.isoformat(),
+        "cash_per_share": round(cash_per_share, 8),
+    }
 
 
 def _html_text(value: str) -> str:

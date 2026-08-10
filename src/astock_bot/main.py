@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from .config import load_config
 from .service import MonitorService
+from .workspace import WorkspaceRegistry
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,7 +32,11 @@ def main() -> int:
     config_path = os.getenv("ASTOCK_CONFIG", "config.yaml")
     config = load_config(config_path)
     if args.command == "health":
-        print(json.dumps({"ok": True, "config": str(Path(config_path)), "positions": len(config.positions)}, ensure_ascii=False))
+        registry = WorkspaceRegistry.from_config_path(config_path)
+        print(json.dumps({
+            "ok": True, "config": str(Path(config_path)), "positions": len(config.positions),
+            "workspaces": len(registry.list()),
+        }, ensure_ascii=False))
         return 0
     if args.command == "once":
         service = MonitorService(config)
@@ -56,6 +61,8 @@ def main() -> int:
         try:
             # 每轮重新读取只读挂载的配置，成交确认后无需重启容器。
             config = load_config(config_path)
+            registry = WorkspaceRegistry.from_config_path(config_path)
+            workspace_configs = [load_config(config_path, workspace.id) for workspace in registry.list()]
         except Exception as exc:
             print(json.dumps({"timestamp": datetime.now().isoformat(), "config_error": str(exc)}, ensure_ascii=False), file=sys.stderr, flush=True)
             time.sleep(15)
@@ -69,18 +76,26 @@ def main() -> int:
             scheduled = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
             delta = (now - scheduled).total_seconds()
             if 0 <= delta <= recovery_window:
-                service = MonitorService(config)
-                if not service.state.claim_run(now.date(), node):
-                    continue
-                try:
-                    execution_type = "scheduled" if delta <= window else "scheduled_recovery"
-                    result = service.run_node(node, now=now, execution_type=execution_type)
-                    print(json.dumps({"timestamp": now.isoformat(), **result}, ensure_ascii=False, default=str), flush=True)
-                except Exception as exc:
-                    # Feishu may have accepted the request before a client
-                    # timeout. Keep the at-most-once claim to prevent a
-                    # duplicate notification on the next scheduler poll.
-                    print(json.dumps({"timestamp": now.isoformat(), "node": node, "error": str(exc)}, ensure_ascii=False), file=sys.stderr, flush=True)
+                for workspace_config in workspace_configs:
+                    if not workspace_config.positions:
+                        continue
+                    service = MonitorService(workspace_config)
+                    if not service.state.claim_run(now.date(), node):
+                        continue
+                    try:
+                        execution_type = "scheduled" if delta <= window else "scheduled_recovery"
+                        result = service.run_node(node, now=now, execution_type=execution_type)
+                        print(json.dumps({
+                            "timestamp": now.isoformat(), "workspace_id": workspace_config.workspace_id, **result,
+                        }, ensure_ascii=False, default=str), flush=True)
+                    except Exception as exc:
+                        # Feishu may have accepted the request before a client
+                        # timeout. Keep the at-most-once claim to prevent a
+                        # duplicate notification on the next scheduler poll.
+                        print(json.dumps({
+                            "timestamp": now.isoformat(), "workspace_id": workspace_config.workspace_id,
+                            "node": node, "error": str(exc),
+                        }, ensure_ascii=False), file=sys.stderr, flush=True)
         summary_config = config.section("daily_summary")
         if bool(summary_config.get("enabled", False)):
             summary_time = str(summary_config.get("time", "15:30"))
@@ -89,15 +104,23 @@ def main() -> int:
             delta = (now - scheduled).total_seconds()
             state_key = f"summary:{summary_time}"
             if 0 <= delta <= recovery_window:
-                service = MonitorService(config)
-                if service.state.claim_run(now.date(), state_key):
-                    try:
-                        result = service.run_daily_summary(now=now)
-                        print(json.dumps({"timestamp": now.isoformat(), **result}, ensure_ascii=False, default=str), flush=True)
-                    except Exception as exc:
-                        # A summary timeout is also an uncertain delivery;
-                        # do not automatically resend it.
-                        print(json.dumps({"timestamp": now.isoformat(), "node": summary_time, "error": str(exc)}, ensure_ascii=False), file=sys.stderr, flush=True)
+                for workspace_config in workspace_configs:
+                    if not workspace_config.positions:
+                        continue
+                    service = MonitorService(workspace_config)
+                    if service.state.claim_run(now.date(), state_key):
+                        try:
+                            result = service.run_daily_summary(now=now)
+                            print(json.dumps({
+                                "timestamp": now.isoformat(), "workspace_id": workspace_config.workspace_id, **result,
+                            }, ensure_ascii=False, default=str), flush=True)
+                        except Exception as exc:
+                            # A summary timeout is also an uncertain delivery;
+                            # do not automatically resend it.
+                            print(json.dumps({
+                                "timestamp": now.isoformat(), "workspace_id": workspace_config.workspace_id,
+                                "node": summary_time, "error": str(exc),
+                            }, ensure_ascii=False), file=sys.stderr, flush=True)
         time.sleep(15)
 
 

@@ -5,15 +5,18 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{{ title }}</title>
     <link rel="stylesheet" href="/static/styles.css?v={{ asset_version }}">
+    <link rel="stylesheet" href="/static/workspace.css?v={{ asset_version }}">
   </head>
   <body>
     <header class="site-header">
       <div class="header-inner">
-        <a class="brand" href="/"><i></i><span>持仓纪律</span></a>
+        <a class="brand" href="{{ workspace_base }}"><i></i><span>持仓纪律</span></a>
         <nav>
-          <a class="{{ 'active' if request.url.path == '/' else '' }}" href="/">看板</a>
-          <a class="{{ 'active' if request.url.path == '/positions' else '' }}" href="/positions">持仓</a>
-          <a class="{{ 'active' if request.url.path == '/watchlist' else '' }}" href="/watchlist">股票池</a>
+          <a class="{{ 'active' if request.url.path == workspace_base else '' }}" href="{{ workspace_base }}">看板</a>
+          <a class="{{ 'active' if request.url.path == workspace_base ~ '/positions' else '' }}" href="{{ workspace_base }}/positions">持仓</a>
+          <a class="{{ 'active' if request.url.path == workspace_base ~ '/watchlist' else '' }}" href="{{ workspace_base }}/watchlist">股票池</a>
+          <a class="{{ 'active' if request.url.path == workspace_base ~ '/notifications' else '' }}" href="{{ workspace_base }}/notifications">消息配置</a>
+          <form method="post" action="/workspaces" class="workspace-create"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">新建工作区</button></form>
         </nav>
       </div>
     </header>

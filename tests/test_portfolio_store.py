@@ -1,6 +1,7 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from astock_bot.portfolio_store import PortfolioStore
 
@@ -27,6 +28,35 @@ def portfolio() -> dict:
 
 
 class PortfolioStoreTests(unittest.TestCase):
+    def test_notification_subscriptions_encrypt_webhook_and_deduplicate_scope(self):
+        with TemporaryDirectory() as directory, patch.dict("os.environ", {"NOTIFICATION_ENCRYPTION_KEY": "test-key"}):
+            store = PortfolioStore(Path(directory) / "portfolio.db")
+            raw = {"portfolio": portfolio(), "notification": {"webhook": "", "secret": ""}}
+            raw["portfolio"]["positions"].append({
+                "symbol": "601336.SH", "name": "新华保险", "role": "watchlist",
+                "main_shares": 0, "economic_basis": 0, "sector": "insurance",
+                "satellite_limit": 100, "main_adjustment_shares": 100, "peers": [],
+                "satellite": {"active": False, "shares": 0}, "migration": {},
+            })
+            store.ensure_seed(raw["portfolio"])
+            store.create_notification_collection("铜专题", "发给有色研究群")
+            collection = next(item for item in store.notification_collections(raw) if item["name"] == "铜专题")
+            store.update_notification_collection_members(collection["id"], ["600362.SH"], raw)
+            destination_id = store.save_notification_destination(
+                destination_id=None, name="有色机器人", webhook="https://open.feishu.cn/open-apis/bot/v2/hook/test",
+                secret="", min_confidence="中", send_actions=True, send_summary=True,
+                receive_critical_all=False, enabled=True,
+                collection_keys=[collection["key"]], symbols=["600362.SH"], raw=raw,
+            )
+            stored = store.notification_destinations(raw, include_secrets=True)
+            target = next(item for item in stored if item["id"] == destination_id)
+            self.assertEqual(target["webhook"], "https://open.feishu.cn/open-apis/bot/v2/hook/test")
+            self.assertEqual(target["symbols"], ["600362.SH"])
+            self.assertIn(collection["key"], target["collection_keys"])
+            self.assertFalse("hook/test" in (Path(directory) / "portfolio.db").read_bytes().decode("latin1"))
+            store.mark_delivery(destination_id, "event-key", "action", "sent", "message")
+            self.assertTrue(store.delivery_claimed(destination_id, "event-key", "action"))
+
     def test_seed_and_main_trade_update_shared_snapshot(self):
         with TemporaryDirectory() as directory:
             store = PortfolioStore(Path(directory) / "portfolio.db")
@@ -102,6 +132,58 @@ class PortfolioStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "已登记到账"):
                 store.record_dividend(
                     symbol="600362.SH", amount=400.0, executed_at="2026-08-08"
+                )
+
+    def test_auto_dividend_uses_record_date_shares_and_is_idempotent(self):
+        with TemporaryDirectory() as directory:
+            store = PortfolioStore(Path(directory) / "portfolio.db")
+            raw = {"portfolio": portfolio()}
+            store.ensure_seed(raw["portfolio"])
+            # A later sale changes current shares but not the entitlement.
+            store.record_trade(
+                symbol="600362.SH", bucket="main", side="sell", shares=100,
+                price=45.0, fee=5.0, executed_at="2026-08-08",
+            )
+            event = {
+                "type": "cash_dividend", "record_date": "2026-08-06",
+                "ex_date": "2026-08-07", "payment_date": "2026-08-08",
+                "cash_per_share": 2.0, "auto_discovered": True,
+                "source_url": "https://www.sse.com.cn/disclosure/dividend.pdf",
+            }
+            outcomes = store.sync_auto_dividends(
+                symbol="600362.SH", events=[event], as_of="2026-08-08",
+            )
+            self.assertEqual(outcomes[0]["status"], "settled")
+            self.assertEqual(outcomes[0]["eligible_shares"], 200)
+            after = store.snapshot(raw)
+            self.assertEqual(after["cash"], 14895.0)
+            self.assertEqual(after["positions"][0]["economic_basis"], 3105.0)
+            self.assertEqual(store.transactions()[0]["side"], "dividend")
+            self.assertIn("auto-dividend-event", store.transactions()[0]["note"])
+            self.assertEqual(
+                store.sync_auto_dividends(
+                    symbol="600362.SH", events=[event], as_of="2026-08-09",
+                ),
+                [],
+            )
+
+    def test_auto_dividend_refuses_ambiguous_record_date_trade(self):
+        with TemporaryDirectory() as directory:
+            store = PortfolioStore(Path(directory) / "portfolio.db")
+            raw = {"portfolio": portfolio()}
+            store.ensure_seed(raw["portfolio"])
+            store.record_trade(
+                symbol="600362.SH", bucket="main", side="sell", shares=100,
+                price=45.0, fee=5.0, executed_at="2026-08-06",
+            )
+            event = {
+                "type": "cash_dividend", "record_date": "2026-08-06",
+                "ex_date": "2026-08-07", "payment_date": "2026-08-07",
+                "cash_per_share": 2.0, "auto_discovered": True,
+            }
+            with self.assertRaisesRegex(ValueError, "股权登记日存在成交"):
+                store.sync_auto_dividends(
+                    symbol="600362.SH", events=[event], as_of="2026-08-07",
                 )
 
     def test_pre_adjusted_dividend_only_increases_cash_and_uses_record_date_shares(self):
@@ -266,6 +348,24 @@ class PortfolioStoreTests(unittest.TestCase):
                     symbol="600000.SH", bucket="main", side="buy", shares=100,
                     price=10.0, fee=5.0, executed_at="2026-08-08",
                 )
+
+    def test_new_workspace_starts_empty_and_can_calibrate_cash(self):
+        with TemporaryDirectory() as directory:
+            store = PortfolioStore(Path(directory) / "portfolio.db", seed_static=False)
+            raw = {"portfolio": portfolio(), "_workspace_seed_static": False}
+            initial = store.snapshot(raw)
+            self.assertEqual(initial["cash"], 0.0)
+            self.assertEqual(initial["positions"], [])
+
+            store.set_available_cash(
+                amount=12500.0,
+                executed_at="2026-08-08",
+                note="新工作区初始资金",
+            )
+            self.assertEqual(store.snapshot(raw)["cash"], 12500.0)
+            entry = store.transactions()[0]
+            self.assertEqual(entry["side"], "cash_adjustment")
+            self.assertEqual(entry["cash_delta"], 12500.0)
 
 
 if __name__ == "__main__":

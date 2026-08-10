@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-title">
+  <div>
+    <p class="eyebrow">DELIVERY</p>
+    <h1>消息配置</h1>
+    <p>本工作区的全部持仓和观察标的，统一推送到这一台飞书机器人。</p>
+  </div>
+  <span class="count">{{ holdings|length }} 持仓 · {{ watchlist|length }} 观察</span>
+</section>
+
+{% if not notification_key_available %}
+<section class="flash error">本机尚未配置通知加密密钥，暂不能安全保存飞书 Webhook。</section>
+{% endif %}
+
+<section class="settings-layout">
+  <article class="panel form-panel notification-settings">
+    <div class="section-head">
+      <div><p class="eyebrow">FEISHU</p><h2>默认机器人</h2></div>
+      <span>{{ '已加密保存' if notification_settings.webhook_configured else '尚未配置' }}</span>
+    </div>
+    <form method="post" action="{{ workspace_base }}/notifications" class="form-grid">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label class="full">飞书 Webhook
+        <input name="webhook" type="url" placeholder="{{ '已加密保存；留空则保留现有地址' if notification_settings.webhook_configured else 'https://open.feishu.cn/open-apis/bot/...' }}">
+      </label>
+      <label>最低置信度
+        <select name="min_confidence">
+          <option value="中" {% if notification_settings.min_confidence == '中' %}selected{% endif %}>中：常规可执行建议</option>
+          <option value="高" {% if notification_settings.min_confidence == '高' %}selected{% endif %}>高：只接收强确认</option>
+        </select>
+      </label>
+      <div class="delivery-scope"><b>自动覆盖范围</b><span>全部当前持仓与观察仓</span></div>
+      <button class="full" type="submit">保存消息配置</button>
+    </form>
+    {% if notification_settings.webhook_configured %}
+    <form method="post" action="{{ workspace_base }}/notifications/test" class="button-row">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="quiet" type="submit">发送测试消息</button>
+    </form>
+    {% endif %}
+  </article>
+
+  <aside class="panel notification-help">
+    <p class="eyebrow">WORKSPACE</p>
+    <h2>本工作区独立运行</h2>
+    <p>持仓、股票池、成交流水、风险状态和飞书配置都与其他工作区隔离。</p>
+    <p class="field-note">当前链接即工作区标识。请仅分享给需要查看或维护这份组合的人。</p>
+  </aside>
+</section>
+{% endblock %}

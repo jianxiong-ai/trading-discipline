@@ -23,6 +23,10 @@ class NotifierTests(unittest.TestCase):
         self.assertIn("计划金额约占账户资产7.2%", text)
         self.assertIn("原因：接近日线支撑并出现企稳确认", text)
         self.assertIn("参考：计划止盈价 44.00；风险退出价 41.50；条件失效：跌破41.50且板块转弱", text)
+        self.assertIn("【操作建议】", text)
+        self.assertIn("【触发原因】", text)
+        self.assertIn("【执行参考】", text)
+        self.assertIn("──────────", text)
         self.assertNotIn("事件键", text)
         self.assertNotIn("SAT_BUY", text)
 

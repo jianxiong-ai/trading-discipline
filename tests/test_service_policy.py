@@ -31,6 +31,24 @@ def signal(symbol, code, category, reward_risk=0, confidence="中", stage="NEUTR
 
 
 class ServicePolicyTests(unittest.TestCase):
+    def test_notification_routing_uses_the_workspace_confidence_threshold(self):
+        with TemporaryDirectory() as directory:
+            service = MonitorService(self._config(Path(directory)))
+            targets = [
+                {
+                    "id": 1, "name": "默认通知", "webhook": "https://example.invalid",
+                    "min_confidence": "高",
+                },
+            ]
+            service._notification_targets = lambda: targets
+            normal = signal("600362.SH", "UP_BREAK", "strategy", confidence="中")
+            routes = service._route_action_signals([normal])
+            self.assertEqual(routes, {})
+            high = signal("601336.SH", "EMERGENCY_RISK", "risk", confidence="高")
+            routes = service._route_action_signals([high])
+            self.assertEqual(list(routes), [1])
+            self.assertEqual(routes[1][1], [high])
+
     def test_message_budget_counts_combined_node_and_never_suppresses_exit(self):
         with TemporaryDirectory() as directory:
             service = MonitorService(self._config(Path(directory)))

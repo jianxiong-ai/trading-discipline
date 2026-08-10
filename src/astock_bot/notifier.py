@@ -26,10 +26,13 @@ def render_message(
     lines = [f"【{title}｜{node}】"]
     for index, signal in enumerate(signals):
         if index:
-            lines.append("")
+            lines.extend(["", "━━━━━━━━━━", ""])
         change_pct = signal.details.get("change_pct")
         change_text = f"{float(change_pct):+.2f}%" if change_pct is not None else "涨跌幅暂缺"
+        # Keep the instrument/price line compact, then use explicit section
+        # headings and blank lines so Feishu's plain-text card remains scannable.
         lines.append(f"{signal.name}（{signal.symbol}） {signal.price:.2f}（{change_text}）")
+        lines.append("【操作建议】")
         satellite_exit = int(signal.details.get("satellite_exit_shares", 0) or 0)
         if satellite_exit:
             action_parts = [f"退出卫星仓{satellite_exit}股"]
@@ -47,7 +50,8 @@ def render_message(
             lines.append(f"建议：{signal.action}{share_text}")
         if signal.details.get("pending_reminder"):
             lines.append("状态：前次建议尚未确认成交，本次为待处理提醒")
-        lines.append(f"原因：{signal.reason}")
+
+        lines.extend(["", "【触发原因】", f"原因：{signal.reason}"])
         evidence = str(signal.details.get("evidence") or "").strip()
         if evidence and signal.code in {
             "UP_BREAK", "DOWN_BREAK", "SAT_BUY", "STAGE_REENTRY", "STAGE_TOP_EXIT",
@@ -56,10 +60,11 @@ def render_message(
             evidence_body, margin_evidence, capital_evidence, holder_evidence = (
                 _partition_auxiliary_evidence(evidence)
             )
+            evidence_lines: list[str] = []
             if evidence_body:
-                lines.append(f"证据：{_clip(evidence_body, evidence_char_limit)}")
+                evidence_lines.append(f"证据：{_clip(evidence_body, evidence_char_limit)}")
             if margin_evidence:
-                lines.append(
+                evidence_lines.append(
                     "两融："
                     + _clip(
                         margin_evidence.removeprefix("两融日终："),
@@ -67,7 +72,7 @@ def render_message(
                     )
                 )
             if capital_evidence:
-                lines.append(
+                evidence_lines.append(
                     "资金："
                     + _clip(
                         capital_evidence.removeprefix("资金日终："),
@@ -75,15 +80,17 @@ def render_message(
                     )
                 )
             if holder_evidence:
-                lines.append(
+                evidence_lines.append(
                     "筹码："
                     + _clip(
                         holder_evidence.removeprefix("股东户数："),
                         margin_char_limit,
                     )
                 )
+            if evidence_lines:
+                lines.extend(["", "【证据】", *evidence_lines])
         if signal.code == "OVERHEAT_WATCH":
-            lines.append("级别：提醒（非买卖指令）")
+            lines.extend(["", "级别：提醒（非买卖指令）"])
         references = []
         if "target" in signal.details:
             if signal.code == "SAT_BUY":
@@ -96,13 +103,14 @@ def render_message(
         if "stop" in signal.details:
             references.append(f"风险退出价 {signal.details['stop']:.2f}")
         references.append(f"条件失效：{signal.invalidation}")
-        lines.append("参考：" + "；".join(references))
+        lines.extend(["", "【执行参考】", "参考：" + "；".join(references)])
         if "holding_days" in signal.details:
             lines.append(f"持有：{signal.details['holding_days']}个交易日")
     if any(signal.code == "WATCH_ENTRY" for signal in signals):
-        lines.append("仅作纪律提醒，不自动下单；首次建仓成交后请填写股数和经济投入，并将role改为holding。")
+        footer = "仅作纪律提醒，不自动下单；首次建仓成交后请填写股数和经济投入，并将role改为holding。"
     else:
-        lines.append("仅作纪律提醒，不自动下单；成交后请更新配置。")
+        footer = "仅作纪律提醒，不自动下单；成交后请更新配置。"
+    lines.extend(["", "──────────", footer])
     return "\n".join(lines)
 
 
@@ -112,6 +120,7 @@ def render_daily_summary(
     day: str,
     title: str,
     warnings: list[str] | None = None,
+    ledger_notes: list[str] | None = None,
 ) -> str:
     triggered = sum(int(row.get("trigger_count", 0)) for row in rows)
     headline = "今日无操作信号，继续按纪律观察。" if not triggered else f"今日共记录{triggered}个操作信号，请复核未确认成交的建议。"
@@ -129,6 +138,8 @@ def render_daily_summary(
         lines.append("节点：" + "｜".join(f"{node} {status_by_node.get(node, '缺失')}" for node in nodes))
     if warnings:
         lines.extend(["", "数据提示：" + _clip("；".join(dict.fromkeys(warnings)), 180)])
+    if ledger_notes:
+        lines.extend(["", "台账更新：" + _clip("；".join(dict.fromkeys(ledger_notes)), 180)])
     lines.append("仅作当日纪律复盘，不代表已成交，也不会自动下单。")
     return "\n".join(lines)
 

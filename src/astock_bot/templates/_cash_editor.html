@@ -1,0 +1,20 @@
+<dialog class="cash-editor" id="cash-editor">
+  <div class="cash-editor-head">
+    <div><p class="eyebrow">ACCOUNT</p><h2>编辑可用资金</h2></div>
+    <form method="dialog"><button class="modal-close" type="submit" aria-label="关闭">×</button></form>
+  </div>
+  <p>填写账户当前可用现金。此操作只校准现金，不会改动持仓、成交记录或经济投入。</p>
+  <form method="post" action="{{ workspace_base }}/cash" class="form-grid">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>当前可用资金
+      <input name="amount" type="number" min="0" step="0.01" value="{{ '%.2f'|format(cash) }}" required>
+    </label>
+    <label>校准日期
+      <input name="executed_at" type="date" value="{{ today }}" required>
+    </label>
+    <label class="full">备注（可选）
+      <input name="note" placeholder="例如：账户初始可用资金">
+    </label>
+    <button class="full" type="submit">保存可用资金</button>
+  </form>
+</dialog>

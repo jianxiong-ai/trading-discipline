@@ -4,7 +4,7 @@
 
 <section class="onboarding-panel">
   <div><p class="eyebrow">SMART ONBOARDING</p><h2>加入一只股票</h2><p>规则引擎先识别；LLM 只做可选复核，不产生买卖建议。</p></div>
-  <form method="post" action="/watchlist" class="onboarding-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <form method="post" action="{{ workspace_base }}/watchlist" class="onboarding-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label class="symbol-input"><span>证券代码</span><input name="symbol" placeholder="例如 600487.SH" autocomplete="off" required></label>
     <label class="check"><input type="checkbox" name="use_llm" {% if not llm_available %}disabled{% endif %}><span>使用 LLM 复核{% if llm_available %} · {{ llm_model }}{% else %} · 未配置{% endif %}</span></label>
     <button type="submit">识别并加入</button>
@@ -32,7 +32,7 @@
         <div><span>同行</span><p>{{ p.peers|join('、') or '同行样本待补充' }}</p></div>
         <div><span>档案来源</span><p>{{ profile.classification_label or '配置导入' }}{% if profile.confidence %} · {{ profile.confidence }}{% endif %}</p><small>{{ profile.profile_source or '本地配置' }}{% if profile.profile_as_of %} · {{ profile.profile_as_of }}{% endif %}</small></div>
       </div>
-      <form method="post" action="/watchlist/{{ p.symbol }}/remove" class="remove-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="quiet danger" type="submit">移出股票池</button></form>
+      <form method="post" action="{{ workspace_base }}/watchlist/{{ p.symbol }}/remove" class="remove-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="quiet danger" type="submit">移出股票池</button></form>
     </details>
   {% else %}<p class="empty">暂无观察标的。输入一只代码开始跟踪。</p>{% endfor %}
   </div>

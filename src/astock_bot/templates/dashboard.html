@@ -2,7 +2,7 @@
 {% block content %}
 <section class="page-title">
   <div><p class="eyebrow">PORTFOLIO</p><h1>今天需要做什么</h1></div>
-  <div class="cash"><span>可用资金</span><strong>¥{{ '{:,.2f}'.format(cash) }}</strong></div>
+  <div class="cash"><span>可用资金</span><div class="cash-value"><strong>¥{{ '{:,.2f}'.format(cash) }}</strong><button class="cash-edit" type="button" title="编辑可用资金" aria-label="编辑可用资金" onclick="document.getElementById('cash-editor').showModal()"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 16.5V20h3.5L18 9.5 14.5 6 4 16.5Zm12.8-11.8 1.7-1.7a1.5 1.5 0 0 1 2.1 2.1L18.9 6.8 16.8 4.7Z"/></svg></button></div></div>
 </section>
 
 <section class="status-strip">
@@ -14,7 +14,7 @@
 <section class="layout-main">
   <div class="stack">
     <article class="panel">
-      <div class="section-head"><div><p class="eyebrow">ACTION</p><h2>最新纪律结论</h2></div><a href="/watchlist">查看复盘</a></div>
+      <div class="section-head"><div><p class="eyebrow">ACTION</p><h2>最新纪律结论</h2></div><a href="{{ workspace_base }}/watchlist">查看复盘</a></div>
       {% if recent_actions %}
         {% set item = recent_actions[0] %}
         <div class="action-card">
@@ -27,7 +27,7 @@
     </article>
 
     <article class="panel">
-      <div class="section-head"><div><p class="eyebrow">HOLDINGS</p><h2>当前持仓</h2></div><a href="/positions">录入成交</a></div>
+      <div class="section-head"><div><p class="eyebrow">HOLDINGS</p><h2>当前持仓</h2></div><a href="{{ workspace_base }}/positions">录入成交</a></div>
       <div class="simple-list">
       {% for p in holdings %}
         <div class="security-row">
@@ -48,4 +48,5 @@
     {% else %}<p class="empty">15:30 后生成当日总结。</p>{% endif %}
   </aside>
 </section>
+{% include "_cash_editor.html" %}
 {% endblock %}

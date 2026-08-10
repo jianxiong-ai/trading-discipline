@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 import os
 import secrets
 from datetime import date
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import yaml
 from fastapi import FastAPI, Form, HTTPException, Request
@@ -15,18 +16,22 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .config import _expand
+from .config import _expand, load_config
+from .notifier import FeishuNotifier
 from .onboarding import StockOnboardingService, sector_options
 from .portfolio_store import PortfolioStore, PortfolioStoreError
+from .workspace import WorkspaceError, WorkspaceRegistry
 
 
 APP_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
 templates.env.globals["asset_version"] = hashlib.sha256(
     (APP_DIR / "static" / "styles.css").read_bytes()
+    + (APP_DIR / "static" / "workspace.css").read_bytes()
 ).hexdigest()[:12]
 app = FastAPI(title="A股持仓纪律", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
+logger = logging.getLogger(__name__)
 
 
 def _config_path() -> Path:
@@ -44,6 +49,18 @@ def _store(raw: dict[str, Any]) -> PortfolioStore:
     if store is None:
         raise RuntimeError("请先在portfolio下配置 database_path")
     return store
+
+
+def _workspace_config(workspace_id: str):
+    try:
+        config = load_config(_config_path(), workspace_id)
+    except WorkspaceError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return config, _store(config.raw)
+
+
+def _workspace_base(workspace_id: str) -> str:
+    return f"/u/{workspace_id}"
 
 
 def _audit_records(raw: dict[str, Any], limit: int = 120) -> list[dict[str, Any]]:
@@ -191,16 +208,12 @@ def _review_records(
     return normalized
 
 
-def _context(request: Request, raw: dict[str, Any], store: PortfolioStore, **extra: Any) -> dict[str, Any]:
+def _context(
+    request: Request, raw: dict[str, Any], store: PortfolioStore, *, workspace_id: str, **extra: Any,
+) -> dict[str, Any]:
     snapshot = store.snapshot(raw)
     positions = snapshot["positions"]
     holdings = [item for item in positions if item.get("role") == "holding"]
-    dividend_events = [
-        {"symbol": item["symbol"], "name": item["name"], **event}
-        for item in holdings
-        for event in item.get("corporate_events", [])
-        if str(event.get("type", "cash_dividend")) == "cash_dividend"
-    ]
     watchlist = [item for item in positions if item.get("role") == "watchlist"]
     context = {
         "request": request,
@@ -209,13 +222,14 @@ def _context(request: Request, raw: dict[str, Any], store: PortfolioStore, **ext
         "cash": snapshot["cash"],
         "positions": positions,
         "holdings": holdings,
-        "dividend_events": dividend_events,
         "watchlist": watchlist,
         "supported_sectors": snapshot["supported_sectors"],
         "sector_options": sector_options(),
         "notice": request.query_params.get("notice"),
         "error": request.query_params.get("error"),
         "csrf_token": _csrf_token(request),
+        "workspace_id": workspace_id,
+        "workspace_base": _workspace_base(workspace_id),
     }
     context.update(extra)
     if "audit_records" in context:
@@ -234,51 +248,119 @@ def _render(request: Request, template: str, context: dict[str, Any]):
     response = templates.TemplateResponse(request, template, context)
     if "astock_csrf" not in request.cookies:
         response.set_cookie("astock_csrf", context["csrf_token"], httponly=True, samesite="strict")
+    # Workspace IDs are local bearer links.  Avoid leaking one in a Referer
+    # header or retaining a private page in a shared browser cache.
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cache-Control"] = "no-store"
     return response
+
+
+def _origin_matches_request_host(origin: str, host: str) -> bool:
+    """Accept the exact origin and equivalent local loopback addresses.
+
+    Docker Desktop can expose this local-only service as either ``localhost``
+    or ``127.0.0.1`` depending on the browser and launch path.  Comparing the
+    raw strings made a safe, local form submission fail when those aliases
+    differed.  The port must still match, and non-local origins must match the
+    request host exactly.
+    """
+    try:
+        origin_url = urlsplit(origin)
+        request_url = urlsplit(f"//{host}")
+    except ValueError:
+        return False
+    # Sandboxed browser surfaces serialize an otherwise local form origin as
+    # the literal string "null".  Accept it only when the request itself is
+    # addressed to a loopback host; the CSRF cookie/form token must still match.
+    local_hosts = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+    if origin.strip().lower() == "null":
+        return request_url.hostname in local_hosts
+    if origin_url.scheme not in {"http", "https"} or not origin_url.hostname:
+        return False
+    if origin_url.netloc == host:
+        return True
+    # Docker Desktop may preserve 0.0.0.0 as the Host header even though the
+    # compose port is published only on the local machine.
+    try:
+        return (
+            origin_url.hostname in local_hosts
+            and request_url.hostname in local_hosts
+            and origin_url.port == request_url.port
+        )
+    except ValueError:
+        return False
 
 
 def _verify_form(request: Request, csrf_token: str) -> None:
     origin = request.headers.get("origin")
     host = request.headers.get("host", "")
-    if origin and not origin.endswith(f"//{host}"):
+    if origin and not _origin_matches_request_host(origin, host):
+        # Only log routing metadata; never log cookies, form values or tokens.
+        logger.warning(
+            "Rejected form origin: path=%s origin=%r host=%r",
+            request.url.path,
+            origin,
+            host,
+        )
         raise HTTPException(status_code=403, detail="来源校验失败")
     cookie = request.cookies.get("astock_csrf")
     if not cookie or not secrets.compare_digest(cookie, csrf_token):
         raise HTTPException(status_code=403, detail="表单已过期，请刷新页面后重试")
 
 
-def _redirect(path: str, *, notice: str | None = None, error: str | None = None) -> RedirectResponse:
+def _redirect(workspace_id: str, path: str = "", *, notice: str | None = None, error: str | None = None) -> RedirectResponse:
     query = urlencode({key: value for key, value in {"notice": notice, "error": error}.items() if value})
-    return RedirectResponse(f"{path}?{query}" if query else path, status_code=303)
+    target = f"{_workspace_base(workspace_id)}{path}"
+    return RedirectResponse(f"{target}?{query}" if query else target, status_code=303)
 
 
 @app.get("/health")
 def health() -> JSONResponse:
-    raw = _raw_config()
-    store = _store(raw)
-    snapshot = store.snapshot(raw)
-    return JSONResponse({"ok": True, "positions": len(snapshot["positions"]), "cash": snapshot["cash"]})
+    config = load_config(_config_path())
+    store = _store(config.raw)
+    snapshot = store.snapshot(config.raw)
+    return JSONResponse({
+        "ok": True, "positions": len(snapshot["positions"]), "cash": snapshot["cash"],
+        "workspaces": len(WorkspaceRegistry.from_config_path(_config_path()).list()),
+    })
 
 
 @app.get("/")
-def dashboard(request: Request):
-    raw = _raw_config()
-    store = _store(raw)
+def root() -> RedirectResponse:
+    workspace = WorkspaceRegistry.from_config_path(_config_path()).default()
+    return RedirectResponse(_workspace_base(workspace.id), status_code=303)
+
+
+@app.post("/workspaces")
+def create_workspace(request: Request, csrf_token: str = Form(...)) -> RedirectResponse:
+    _verify_form(request, csrf_token)
+    workspace = WorkspaceRegistry.from_config_path(_config_path()).create()
+    return RedirectResponse(_workspace_base(workspace.id), status_code=303)
+
+
+@app.get("/u/{workspace_id}")
+def dashboard(workspace_id: str, request: Request):
+    config, store = _workspace_config(workspace_id)
+    raw = config.raw
     records = _audit_records(raw)
     latest = _latest_summary(records)
     recent_actions = [item for item in records if item.get("signals")][:5]
-    return _render(request, "dashboard.html", _context(request, raw, store, latest_summary=latest, recent_actions=recent_actions))
+    return _render(request, "dashboard.html", _context(
+        request, raw, store, workspace_id=workspace_id, latest_summary=latest, recent_actions=recent_actions,
+    ))
 
 
-@app.get("/positions")
-def positions(request: Request):
-    raw = _raw_config()
-    store = _store(raw)
-    return _render(request, "positions.html", _context(request, raw, store, transactions=store.transactions()))
+@app.get("/u/{workspace_id}/positions")
+def positions(workspace_id: str, request: Request):
+    config, store = _workspace_config(workspace_id)
+    return _render(request, "positions.html", _context(
+        request, config.raw, store, workspace_id=workspace_id, transactions=store.transactions(),
+    ))
 
 
-@app.post("/trades")
+@app.post("/u/{workspace_id}/trades")
 def create_trade(
+    workspace_id: str,
     request: Request,
     csrf_token: str = Form(...),
     symbol: str = Form(...),
@@ -294,8 +376,7 @@ def create_trade(
     stop_price: str = Form(""),
 ):
     _verify_form(request, csrf_token)
-    raw = _raw_config()
-    store = _store(raw)
+    config, store = _workspace_config(workspace_id)
     try:
         store.record_trade(
             symbol=symbol,
@@ -311,73 +392,54 @@ def create_trade(
             stop_price=_optional_number(stop_price),
         )
     except PortfolioStoreError as exc:
-        return _redirect("/positions", error=str(exc))
-    return _redirect("/positions", notice="成交已记录，持仓、现金与经济投入已同步更新")
+        return _redirect(workspace_id, "/positions", error=str(exc))
+    return _redirect(workspace_id, "/positions", notice="成交已记录，持仓、现金与经济投入已同步更新")
 
 
-@app.post("/dividends")
-def create_dividend(
+@app.post("/u/{workspace_id}/cash")
+def set_available_cash(
+    workspace_id: str,
     request: Request,
     csrf_token: str = Form(...),
-    symbol: str = Form(...),
     amount: float = Form(...),
     executed_at: str = Form(...),
     note: str = Form(""),
-    event_id: str = Form(""),
 ):
     _verify_form(request, csrf_token)
-    raw = _raw_config()
-    store = _store(raw)
-    static_events = next(
-        (
-            list(item.get("corporate_events", []) or [])
-            for item in raw.get("portfolio", {}).get("positions", [])
-            if str(item.get("symbol", "")).upper() == symbol.strip().upper()
-        ),
-        [],
-    )
+    _config, store = _workspace_config(workspace_id)
     try:
-        mode = store.record_dividend(
-            symbol=symbol,
-            amount=amount,
-            executed_at=executed_at,
-            note=note,
-            event_id=event_id or None,
-            corporate_events=static_events,
-        )
+        store.set_available_cash(amount=amount, executed_at=executed_at, note=note)
     except PortfolioStoreError as exc:
-        return _redirect("/positions", error=str(exc))
-    notice = "分红到账已记录；经济投入已按该分红同步更新"
-    if mode == "pre_adjusted":
-        notice = "分红到账已记录；该公告已在配置中预先调整经济投入，本次仅增加现金"
-    return _redirect("/positions", notice=notice)
+        return _redirect(workspace_id, error=str(exc))
+    return _redirect(workspace_id, notice="可用资金已校准；持仓和经济投入未改动")
 
 
-@app.post("/transactions/{transaction_id}/reverse")
+@app.post("/u/{workspace_id}/transactions/{transaction_id}/reverse")
 def reverse_transaction(
+    workspace_id: str,
     transaction_id: int,
     request: Request,
     csrf_token: str = Form(...),
 ):
     _verify_form(request, csrf_token)
-    raw = _raw_config()
+    config, store = _workspace_config(workspace_id)
     try:
-        _store(raw).reverse_transaction(transaction_id)
+        store.reverse_transaction(transaction_id)
     except PortfolioStoreError as exc:
-        return _redirect("/positions", error=str(exc))
-    return _redirect("/positions", notice="已追加冲销记录，原始流水仍保留")
+        return _redirect(workspace_id, "/positions", error=str(exc))
+    return _redirect(workspace_id, "/positions", notice="已追加冲销记录，原始流水仍保留")
 
 
-@app.get("/watchlist")
-def watchlist(request: Request):
-    raw = _raw_config()
-    store = _store(raw)
+@app.get("/u/{workspace_id}/watchlist")
+def watchlist(workspace_id: str, request: Request):
+    config, store = _workspace_config(workspace_id)
+    raw = config.raw
     records = _audit_records(raw)
     onboarding = StockOnboardingService(raw.get("onboarding", {}))
     return _render(request, "watchlist.html", _context(
             request,
             raw,
-            store,
+            store, workspace_id=workspace_id,
             audit_records=records,
             latest_summary=_latest_summary(records),
             llm_available=onboarding.llm_available,
@@ -385,8 +447,9 @@ def watchlist(request: Request):
         ))
 
 
-@app.post("/watchlist")
+@app.post("/u/{workspace_id}/watchlist")
 def add_watchlist(
+    workspace_id: str,
     request: Request,
     csrf_token: str = Form(...),
     symbol: str = Form(...),
@@ -396,8 +459,8 @@ def add_watchlist(
     peers: str = Form(""),
 ):
     _verify_form(request, csrf_token)
-    raw = _raw_config()
-    store = _store(raw)
+    config, store = _workspace_config(workspace_id)
+    raw = config.raw
     try:
         result = StockOnboardingService(raw.get("onboarding", {})).onboard(
             symbol,
@@ -414,21 +477,63 @@ def add_watchlist(
             analysis_profile=result.analysis_profile,
         )
     except (PortfolioStoreError, OSError, ValueError) as exc:
-        return _redirect("/watchlist", error=str(exc))
+        return _redirect(workspace_id, "/watchlist", error=str(exc))
     coverage = result.analysis_profile.get("coverage_label", "已建立跟踪")
-    return _redirect("/watchlist", notice=f"{result.name} 已识别并加入股票池 · {coverage}")
+    return _redirect(workspace_id, "/watchlist", notice=f"{result.name} 已识别并加入股票池 · {coverage}")
 
 
-@app.post("/watchlist/{symbol}/remove")
-def remove_watchlist(symbol: str, request: Request, csrf_token: str = Form(...)):
+@app.post("/u/{workspace_id}/watchlist/{symbol}/remove")
+def remove_watchlist(workspace_id: str, symbol: str, request: Request, csrf_token: str = Form(...)):
     _verify_form(request, csrf_token)
-    raw = _raw_config()
-    store = _store(raw)
+    _config, store = _workspace_config(workspace_id)
     try:
         store.remove_watchlist(symbol)
     except PortfolioStoreError as exc:
-        return _redirect("/watchlist", error=str(exc))
-    return _redirect("/watchlist", notice="观察标的已移除")
+        return _redirect(workspace_id, "/watchlist", error=str(exc))
+    return _redirect(workspace_id, "/watchlist", notice="观察标的已移除")
+
+
+@app.get("/u/{workspace_id}/notifications")
+def notifications(workspace_id: str, request: Request):
+    config, store = _workspace_config(workspace_id)
+    raw = config.raw
+    context = _context(request, raw, store, workspace_id=workspace_id)
+    context.update({
+        "notification_settings": store.notification_settings(raw),
+        "notification_key_available": store.notification_key_available(),
+    })
+    return _render(request, "notifications.html", context)
+
+
+@app.post("/u/{workspace_id}/notifications")
+def save_notification_settings(
+    workspace_id: str,
+    request: Request,
+    csrf_token: str = Form(...),
+    webhook: str = Form(""),
+    min_confidence: str = Form("中"),
+):
+    _verify_form(request, csrf_token)
+    config, store = _workspace_config(workspace_id)
+    try:
+        store.save_notification_settings(webhook=webhook, min_confidence=min_confidence, raw=config.raw)
+    except PortfolioStoreError as exc:
+        return _redirect(workspace_id, "/notifications", error=str(exc))
+    return _redirect(workspace_id, "/notifications", notice="消息配置已保存；Webhook 已加密保存在本机")
+
+
+@app.post("/u/{workspace_id}/notifications/test")
+def test_notification_settings(workspace_id: str, request: Request, csrf_token: str = Form(...)):
+    _verify_form(request, csrf_token)
+    config, store = _workspace_config(workspace_id)
+    settings = store.notification_settings(config.raw, include_secrets=True)
+    if not settings.get("webhook"):
+        return _redirect(workspace_id, "/notifications", error="Webhook 未配置或无法读取，请重新填写")
+    try:
+        FeishuNotifier(settings["webhook"], settings.get("secret", "")).send("【A股持仓纪律】测试消息：工作区消息配置正常。")
+    except Exception as exc:
+        return _redirect(workspace_id, "/notifications", error=f"测试发送失败：{exc}")
+    return _redirect(workspace_id, "/notifications", notice="测试消息已发送")
 
 
 def _optional_number(value: str) -> float | None:

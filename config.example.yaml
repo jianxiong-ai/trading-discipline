@@ -129,6 +129,14 @@ evidence:
     operating_keywords: [保费收入, 经营情况, 主要经营数据, 季度报告, 年度报告]
     critical_keywords: [立案调查, 立案告知书, 重大违法, 财务造假, 债务逾期, 无法清偿, 破产, 暂停上市, 终止上市, 偿付能力不足, 业绩预亏, 重大资产减值, 评级下调, 被接管]
     caution_keywords: [诉讼, 仲裁, 行政处罚, 监管警示, 纪律处分, 问询函, 风险提示, 整改, 减持, 对外担保]
+  # 仅处理交易所“实施公告”正文中同时明确登记日、除息日、发放日和每股现金额的分红；
+  # 在发放日收盘后的15:30总结节点自动计入现金与经济投入，税费或登记日成交存在歧义时不猜测。
+  dividends:
+    enabled: true
+    lookback_calendar_days: 180
+    max_pages: 12
+    max_documents_per_symbol: 4
+    max_pdf_pages: 12
   corporate_actions:
     enabled: true
     max_age_calendar_days: 60

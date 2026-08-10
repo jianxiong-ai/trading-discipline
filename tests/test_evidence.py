@@ -10,6 +10,7 @@ from astock_bot.evidence import (
     classify_operating_text,
     classify_announcement_title,
     parse_corporate_action_terms,
+    parse_cash_dividend_implementation,
     parse_chinabond_curve,
     parse_miit_column_query,
     parse_miit_listing,
@@ -26,6 +27,81 @@ TZ = ZoneInfo("Asia/Shanghai")
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_cash_dividend_implementation_requires_all_settlement_terms(self):
+        terms = parse_cash_dividend_implementation(
+            "股权登记日：2026年8月6日；除权(息)日：2026年8月7日；"
+            "现金红利发放日：2026年8月7日。每10股派发现金红利20.60元(含税)。"
+        )
+        self.assertEqual(terms["record_date"], "2026-08-06")
+        self.assertEqual(terms["ex_date"], "2026-08-07")
+        self.assertEqual(terms["payment_date"], "2026-08-07")
+        self.assertEqual(terms["cash_per_share"], 2.06)
+        with self.assertRaisesRegex(Exception, "缺少可核验"):
+            parse_cash_dividend_implementation("股权登记日：2026年8月6日；每股派2元")
+
+    def test_collector_reads_only_verified_dividend_implementation_pdf(self):
+        collector = OfficialEvidenceCollector("Asia/Shanghai", {
+            "dividends": {"lookback_calendar_days": 180, "max_pages": 1},
+        })
+        collector._get_json = lambda *_: {"pageHelp": {"data": [{
+            "TITLE": "2025年年度权益分派实施公告",
+            "ADDDATE": "2026-08-05 18:00:00",
+            "URL": "/disclosure/dividend.pdf",
+        }]}}
+        collector._pdf_text = lambda *_: (
+            "股权登记日：2026年8月6日；除权(息)日：2026年8月7日；"
+            "现金红利发放日：2026年8月7日；每股派发现金红利2.06元(含税)。"
+        )
+        position = Position(
+            "601336.SH", "新华保险", 900, 70000, "insurance", 100, 100, (), SatellitePosition(),
+        )
+        events, warnings = collector.collect_cash_dividend_events(
+            (position,), datetime(2026, 8, 7, 15, 30, tzinfo=TZ),
+        )
+        self.assertEqual(warnings, [])
+        self.assertEqual(events["601336.SH"][0]["cash_per_share"], 2.06)
+
+    def test_capital_flow_falls_back_after_an_empty_endpoint_response(self):
+        collector = OfficialEvidenceCollector("Asia/Shanghai", {})
+        requested_urls = []
+
+        def get_json(url, _referer):
+            requested_urls.append(url)
+            if len(requested_urls) == 1:
+                return {"rc": 100, "data": {}}
+            return {
+                "rc": 0,
+                "data": {
+                    "klines": [
+                        "2026-08-07,123456789,0,0,0,0,2.35,0,0,0,0,0,0,0,0"
+                    ]
+                },
+            }
+
+        collector._get_json = get_json
+        observed, main_net, main_pct = collector._fetch_today_main_flow("600362.SH")
+        self.assertEqual(observed, date(2026, 8, 7))
+        self.assertEqual(main_net, 123456789.0)
+        self.assertEqual(main_pct, 2.35)
+        self.assertEqual(len(requested_urls), 2)
+        self.assertTrue(all("/fflow/kline/get" in url for url in requested_urls))
+        self.assertTrue(all("ut=fa5fd1943c7b386f172d6893dbfba10b" in url for url in requested_urls))
+
+    def test_capital_flow_accepts_the_current_compact_kline_format(self):
+        collector = OfficialEvidenceCollector("Asia/Shanghai", {})
+        collector._get_json = lambda *_: {
+            "rc": 0,
+            "data": {
+                "klines": [
+                    "2026-08-10,-258254688.0,191242944.0,67011744.0,-106547792.0,-151706896.0"
+                ]
+            },
+        }
+        observed, main_net, main_pct = collector._fetch_today_main_flow("600362.SH")
+        self.assertEqual(observed, date(2026, 8, 10))
+        self.assertEqual(main_net, -258254688.0)
+        self.assertIsNone(main_pct)
+
     def test_parse_miit_column_and_listing(self):
         page = """
         <script id="x" url="/api/list" queryData="{'pageId':'abc','tagId':'当前栏目_list'}"></script>

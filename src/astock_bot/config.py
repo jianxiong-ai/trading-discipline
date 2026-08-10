@@ -13,6 +13,7 @@ import yaml
 from .models import Position, SatellitePosition
 from .market_calendar import resolve_holidays
 from .portfolio_store import PortfolioStore
+from .workspace import WorkspaceRegistry
 
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
@@ -32,6 +33,7 @@ def _expand(value: Any) -> Any:
 class AppConfig:
     raw: dict[str, Any]
     positions: tuple[Position, ...]
+    workspace_id: str = ""
 
     @property
     def timezone(self) -> str:
@@ -49,10 +51,23 @@ class AppConfig:
         return self.raw.get(name, {})
 
 
-def load_config(path: str | Path) -> AppConfig:
+def load_config(path: str | Path, workspace_id: str | None = None) -> AppConfig:
     config_path = Path(path)
     with config_path.open("r", encoding="utf-8") as handle:
         raw = _expand(yaml.safe_load(handle) or {})
+    registry = WorkspaceRegistry.from_config_path(config_path)
+    workspace = registry.default() if workspace_id is None else registry.get(workspace_id)
+    database_value = raw.get("portfolio", {}).get("database_path", "data/portfolio.db")
+    state_value = raw.get("state_file", "data/state.json")
+    log_value = raw.get("log_file", "data/events.jsonl")
+    database_path = _resolve_local_path(database_value, config_path)
+    state_path = _resolve_local_path(state_value, config_path)
+    log_path = _resolve_local_path(log_value, config_path)
+    raw["_workspace_id"] = workspace.id
+    raw["_workspace_seed_static"] = workspace.is_default
+    raw["_workspace_database_path"] = str(registry.ledger_path(workspace, database_path))
+    raw["state_file"] = str(registry.state_path(workspace, state_path))
+    raw["log_file"] = str(registry.log_path(workspace, log_path))
     # Exchange-first calendar; manually listed dates remain a local override.
     raw["holidays"] = sorted(resolve_holidays(raw, config_path))
     # Strategy rules remain in YAML; confirmed portfolio facts live in the
@@ -120,10 +135,31 @@ def load_config(path: str | Path) -> AppConfig:
         )
         _validate_position(position)
         positions.append(position)
-    if not positions:
+    if not positions and workspace.is_default:
         raise ValueError("portfolio.positions 至少需要一只股票")
+    if not workspace.is_default:
+        # YAML may name the default user's holdings in static correlation groups.
+        # A fresh personal workspace starts empty, so retain sector-based caps
+        # but drop symbols it does not own.
+        known = {position.symbol for position in positions}
+        groups = raw.get("risk", {}).get("correlation_groups", {})
+        for group in groups.values():
+            if isinstance(group, dict):
+                group["symbols"] = [
+                    str(symbol).upper() for symbol in group.get("symbols", [])
+                    if str(symbol).upper() in known
+                ]
+        raw.setdefault("risk", {})["correlation_groups"] = {
+            name: group for name, group in groups.items()
+            if group.get("symbols") or group.get("sectors")
+        }
     _validate_config(raw, positions)
-    return AppConfig(raw=raw, positions=tuple(positions))
+    return AppConfig(raw=raw, positions=tuple(positions), workspace_id=workspace.id)
+
+
+def _resolve_local_path(value: str | Path, config_path: Path) -> Path:
+    path = Path(str(value))
+    return path if path.is_absolute() else config_path.resolve().parent / path
 
 
 def _optional_float(value: Any) -> float | None:
@@ -408,6 +444,16 @@ def _validate_config(raw: dict[str, Any], positions: list[Position]) -> None:
         raise ValueError("evidence.announcements.max_pdf_pages 必须大于0")
     if float(announcements.get("operating_change_threshold_pct", 3.0)) <= 0:
         raise ValueError("evidence.announcements.operating_change_threshold_pct 必须大于0")
+    dividends = evidence.get("dividends", {})
+    if bool(dividends.get("enabled", True)):
+        if int(dividends.get("lookback_calendar_days", 180)) < 30:
+            raise ValueError("evidence.dividends.lookback_calendar_days 不得小于30")
+        if int(dividends.get("max_pages", 12)) <= 0:
+            raise ValueError("evidence.dividends.max_pages 必须大于0")
+        if int(dividends.get("max_documents_per_symbol", 4)) <= 0:
+            raise ValueError("evidence.dividends.max_documents_per_symbol 必须大于0")
+        if int(dividends.get("max_pdf_pages", 12)) <= 0:
+            raise ValueError("evidence.dividends.max_pdf_pages 必须大于0")
     corporate_actions = evidence.get("corporate_actions", {})
     if bool(corporate_actions.get("enabled", False)):
         if int(corporate_actions.get("max_age_calendar_days", 60)) <= 0:
