@@ -1,0 +1,40 @@
+services:
+  monitor:
+    image: ${ACR_IMAGE:?Set ACR_IMAGE in .env before starting the ACR deployment.}
+    restart: unless-stopped
+    environment:
+      ASTOCK_CONFIG: /app/config.yaml
+      FEISHU_WEBHOOK: ${FEISHU_WEBHOOK:-}
+      FEISHU_SECRET: ${FEISHU_SECRET:-}
+      NOTIFICATION_ENCRYPTION_KEY: ${NOTIFICATION_ENCRYPTION_KEY:-}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-m", "astock_bot.main", "health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  web:
+    image: ${ACR_IMAGE:?Set ACR_IMAGE in .env before starting the ACR deployment.}
+    restart: unless-stopped
+    command: ["uvicorn", "astock_bot.web:app", "--host", "0.0.0.0", "--port", "8787"]
+    environment:
+      ASTOCK_CONFIG: /app/config.yaml
+      FEISHU_WEBHOOK: ${FEISHU_WEBHOOK:-}
+      FEISHU_SECRET: ${FEISHU_SECRET:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-v4-flash}
+      NOTIFICATION_ENCRYPTION_KEY: ${NOTIFICATION_ENCRYPTION_KEY:-}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+    ports:
+      - "8787:8787"
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8787/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

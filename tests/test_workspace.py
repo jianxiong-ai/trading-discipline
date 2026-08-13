@@ -51,14 +51,15 @@ class WorkspaceRegistryTests(unittest.TestCase):
             self.assertTrue(registry.has_access(default, token))
             self.assertFalse(registry.has_access(created, token))
 
-    def test_local_origin_aliases_are_accepted_but_remote_origin_is_rejected(self):
+    def test_same_origin_and_local_aliases_are_accepted_but_remote_origin_is_rejected(self):
+        self.assertTrue(_origin_matches_request_host("http://121.40.151.18:8787", "121.40.151.18:8787"))
         self.assertTrue(_origin_matches_request_host("http://localhost:8787", "127.0.0.1:8787"))
         self.assertTrue(_origin_matches_request_host("http://127.0.0.1:8787", "localhost:8787"))
         self.assertTrue(_origin_matches_request_host("http://127.0.0.1:8787", "0.0.0.0:8787"))
         self.assertTrue(_origin_matches_request_host("http://0.0.0.0:8787", "localhost:8787"))
         self.assertTrue(_origin_matches_request_host("http://localhost:8787", "localhost:8787"))
         self.assertTrue(_origin_matches_request_host("null", "127.0.0.1:8787"))
-        self.assertFalse(_origin_matches_request_host("null", "example.com"))
+        self.assertTrue(_origin_matches_request_host("null", "121.40.151.18:8787"))
         self.assertFalse(_origin_matches_request_host("https://example.com", "localhost:8787"))
         self.assertFalse(_origin_matches_request_host("http://localhost:9000", "127.0.0.1:8787"))
 

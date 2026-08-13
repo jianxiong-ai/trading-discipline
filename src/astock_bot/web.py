@@ -312,12 +312,15 @@ def _origin_matches_request_host(origin: str, host: str) -> bool:
         request_url = urlsplit(f"//{host}")
     except ValueError:
         return False
-    # Sandboxed browser surfaces serialize an otherwise local form origin as
-    # the literal string "null".  Accept it only when the request itself is
-    # addressed to a loopback host; the CSRF cookie/form token must still match.
+    # Sandboxed and in-app browser surfaces can serialize an otherwise
+    # same-site form origin as the literal string "null".  This also happens
+    # for some mobile clients viewing a public-IP deployment.  There is no
+    # usable origin to compare in that case, so rely on the independent
+    # synchronizer-token check in _verify_form below: a cross-site page cannot
+    # read this application's HttpOnly CSRF cookie or its rendered form token.
     local_hosts = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
     if origin.strip().lower() == "null":
-        return request_url.hostname in local_hosts
+        return True
     if origin_url.scheme not in {"http", "https"} or not origin_url.hostname:
         return False
     if origin_url.netloc == host:

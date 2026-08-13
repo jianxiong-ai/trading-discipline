@@ -7,10 +7,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --retries 8 --timeout 180 -r requirements.txt
 COPY src ./src
 COPY config.example.yaml ./config.example.yaml
 RUN mkdir -p /app/data
 
 CMD ["python", "-m", "astock_bot.main", "run"]
-

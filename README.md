@@ -31,6 +31,9 @@ docker compose up -d --build
 docker compose logs -f monitor
 ```
 
+生产环境部署和之后通过 ACR 更新的完整流程见
+[`docs/deployment-alicloud-acr.md`](docs/deployment-alicloud-acr.md)。
+
 首次启动后，在本机打开 `http://127.0.0.1:8787`。页面仅绑定本机回环地址，不会暴露到局域网或公网。首次会跳转到一个受密码保护的默认工作区；默认密码为 `960818`。工作区链接中的随机标识只用于定位和隔离这份组合，分享链接时也要一并通过安全方式分享对应密码。它包含四个页面：
 
 - **看板**：只突出今天是否有动作、当前主仓/卫星仓和日内总结。
