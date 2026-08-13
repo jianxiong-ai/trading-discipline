@@ -371,6 +371,33 @@ def _validate_config(raw: dict[str, Any], positions: list[Position]) -> None:
             value = float(migration.get(key, 0))
             if not 0 < value <= 1:
                 raise ValueError(f"migration_mode.{key} 必须在(0, 1]之间")
+        satellite_overlay = float(migration.get("satellite_overlay_max_weight", 0.035))
+        if not 0 < satellite_overlay <= 1:
+            raise ValueError(
+                "migration_mode.satellite_overlay_max_weight 必须在(0, 1]之间"
+            )
+        if satellite_overlay < effective_sizing["satellite_weight"]:
+            raise ValueError(
+                "migration_mode.satellite_overlay_max_weight 不得低于 "
+                "position_sizing.satellite_weight"
+            )
+        for position in positions:
+            if not bool(position.migration.get("enabled", False)):
+                continue
+            position_satellite_weight = float(
+                position.sizing.get(
+                    "satellite_weight", effective_sizing["satellite_weight"]
+                )
+            )
+            if position_satellite_weight > satellite_overlay:
+                raise ValueError(
+                    f"{position.symbol} sizing.satellite_weight 不得高于 "
+                    "migration_mode.satellite_overlay_max_weight"
+                )
+        if int(migration.get("satellite_reduction_cooldown_trading_days", 1)) < 0:
+            raise ValueError(
+                "migration_mode.satellite_reduction_cooldown_trading_days 不得小于0"
+            )
         groups = migration.get("correlation_groups", {})
         known_groups = set(risk.get("correlation_groups", {}))
         if set(groups) - known_groups:
@@ -570,6 +597,22 @@ def _validate_config(raw: dict[str, Any], positions: list[Position]) -> None:
         raise ValueError("watchlist_rules.minimum_strong_confirmations 必须在[2, 4]之间")
     if int(watchlist.get("starter_cooldown_trading_days", 3)) < 0:
         raise ValueError("watchlist_rules.starter_cooldown_trading_days 不得小于0")
+    satellite = raw.get("satellite_rules", {})
+    satellite_risk_weight = float(satellite.get("entry_risk_weight", 0.0025))
+    if not 0 < satellite_risk_weight <= 1:
+        raise ValueError("satellite_rules.entry_risk_weight 必须在(0, 1]之间")
+    one_lot_max_weight = float(
+        satellite.get("one_lot_tolerance_max_weight", 0.035)
+    )
+    if not 0 < one_lot_max_weight <= 1:
+        raise ValueError(
+            "satellite_rules.one_lot_tolerance_max_weight 必须在(0, 1]之间"
+        )
+    if one_lot_max_weight < effective_sizing["satellite_weight"]:
+        raise ValueError(
+            "satellite_rules.one_lot_tolerance_max_weight 不得低于 "
+            "position_sizing.satellite_weight"
+        )
     execution = raw.get("execution_constraints", {})
     for key in ("cash_reserve_amount", "fixed_buy_cost_buffer"):
         if float(execution.get(key, 0)) < 0:

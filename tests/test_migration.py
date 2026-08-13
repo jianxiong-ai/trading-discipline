@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -121,6 +121,50 @@ class MigrationStateTests(unittest.TestCase):
             )
             self.assertFalse(state_file.exists())
             self.assertEqual(service.state.migration_state()["positions"], {})
+
+    def test_position_ratchet_uses_main_shares_and_records_satellite_cooldown(self):
+        with TemporaryDirectory() as folder:
+            state_file = Path(folder) / "state.json"
+            quotes = {
+                "600362.SH": make_quote("600362.SH", 60),
+                "601318.SH": make_quote("601318.SH", 50),
+            }
+            initial = MonitorService(self._config(state_file, 1000))
+            initial._migration_contexts(
+                quotes, 100000, True, today=date(2026, 7, 29)
+            )
+
+            reduced_base = self._config(state_file, 900)
+            first = reduced_base.positions[0]
+            satellite = SatellitePosition(
+                True, 100, 60, date(2026, 7, 29), 59, 63, 58
+            )
+            reduced_config = AppConfig(reduced_base.raw, (
+                Position(
+                    first.symbol, first.name, first.main_shares,
+                    first.economic_basis, first.sector, first.satellite_limit,
+                    first.main_adjustment_shares, first.peers, satellite,
+                    first.sizing, first.migration,
+                ),
+                reduced_base.positions[1],
+            ))
+            reduced = MonitorService(reduced_config)
+            contexts, groups = reduced._migration_contexts(
+                quotes, 100000, True, today=date(2026, 7, 30)
+            )
+            context = contexts["600362.SH"]
+            self.assertAlmostEqual(context["position_ceiling"], 54000 / 100000 + 0.03)
+            self.assertAlmostEqual(groups["legacy_group"], 79000 / 100000 + 0.03)
+            self.assertEqual(context["last_main_reduction_date"], "2026-07-30")
+
+            guarded = reduced._migration_satellite_context(
+                reduced_config.positions[0], context, {}, date(2026, 7, 31)
+            )
+            self.assertIn("冷静期", guarded["satellite_entry_block_reason"])
+            released = reduced._migration_satellite_context(
+                reduced_config.positions[0], context, {}, date(2026, 8, 3)
+            )
+            self.assertIsNone(released["satellite_entry_block_reason"])
 
 
 if __name__ == "__main__":

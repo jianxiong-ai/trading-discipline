@@ -174,6 +174,61 @@ class StrategyTests(unittest.TestCase):
         )
         self.assertEqual(signals, [])
 
+    def test_migration_satellite_uses_separate_temporary_overlay(self):
+        migration = {
+            "enabled": True,
+            "position_ceiling": 0.40,
+            "satellite_overlay_max_weight": 0.035,
+            "risk_principal_ceiling": 87720,
+        }
+        signals = evaluate_position(
+            position(), quote(), tech(), "10:15", 0.01, 0.005,
+            date(2026, 7, 28),
+            {"entry_risk_weight": 0.0025},
+            {"max_loss_ratio": 0.99, "warning_ratio": 0.90},
+            set(), 100000, 0.40, 180000, None, None, {}, 0,
+            equity_evidence(), {}, {}, {}, migration,
+        )
+        self.assertEqual([signal.code for signal in signals], ["SAT_BUY"])
+        self.assertEqual(signals[0].shares, 100)
+
+        diagnostics = {}
+        blocked = evaluate_position(
+            position(), quote(), tech(), "10:15", 0.01, 0.005,
+            date(2026, 7, 28),
+            {"entry_risk_weight": 0.0025},
+            {"max_loss_ratio": 0.99, "warning_ratio": 0.90},
+            set(), 100000, 0.43, 180000, None, None, {}, 0,
+            equity_evidence(), {}, diagnostics, {}, migration,
+        )
+        self.assertEqual(blocked, [])
+        self.assertAlmostEqual(
+            diagnostics["metrics"]["satellite_entry"]["position_cap"], 0.435
+        )
+        self.assertEqual(diagnostics["metrics"]["satellite_entry"]["sized_shares"], 0)
+
+    def test_migration_satellite_is_blocked_by_pending_reduction_guard(self):
+        diagnostics = {}
+        signals = evaluate_position(
+            position(), quote(), tech(), "10:15", 0.01, 0.005,
+            date(2026, 7, 28), {},
+            {"max_loss_ratio": 0.99, "warning_ratio": 0.90},
+            set(), 100000, 0.40, 180000, None, None, {}, 0,
+            equity_evidence(), {}, diagnostics, {},
+            {
+                "enabled": True,
+                "position_ceiling": 0.40,
+                "satellite_overlay_max_weight": 0.035,
+                "risk_principal_ceiling": 87720,
+                "satellite_entry_block_reason": "存在待处理减仓信号",
+            },
+        )
+        self.assertEqual(signals, [])
+        self.assertFalse(
+            diagnostics["checks"]["satellite_entry"]
+            ["no_pending_reduction_or_cooldown"]["passed"]
+        )
+
     def test_satellite_entry_requires_complete_15m_and_historical_volume(self):
         incomplete = tech()
         incomplete.complete_15m = False
@@ -540,6 +595,35 @@ class StrategyTests(unittest.TestCase):
             overridden, 10, 180000, {"satellite_weight": 0.03},
         )
         self.assertEqual(satellite_shares, 300)
+
+    def test_satellite_one_lot_tolerance_avoids_rounding_valid_setup_to_zero(self):
+        one_lot, weight = _planned_satellite_entry_shares(
+            position(), 58.5, 180000, {"satellite_weight": 0.03}, {},
+            {"one_lot_tolerance_max_weight": 0.035},
+        )
+        too_large, _ = _planned_satellite_entry_shares(
+            position(), 70, 180000, {"satellite_weight": 0.03}, {},
+            {"one_lot_tolerance_max_weight": 0.035},
+        )
+        self.assertEqual(one_lot, 100)
+        self.assertAlmostEqual(weight, 100 * 58.5 / 180000)
+        self.assertEqual(too_large, 0)
+
+    def test_satellite_uses_its_own_smaller_stop_risk_budget(self):
+        diagnostics = {}
+        signals = evaluate_position(
+            position(), quote(), tech(), "10:15", 0.01, 0.005,
+            date(2026, 7, 28),
+            {"entry_risk_weight": 0.0025},
+            {"max_loss_ratio": 0.99, "warning_ratio": 0.90},
+            set(), 100000, 0.20, 180000, None, None, {}, 0,
+            equity_evidence(), {}, diagnostics,
+        )
+        self.assertEqual([signal.code for signal in signals], ["SAT_BUY"])
+        self.assertAlmostEqual(
+            diagnostics["metrics"]["satellite_entry"]["risk_budget"], 450
+        )
+        self.assertAlmostEqual(signals[0].details["planned_nav_ratio"], 4000 / 180000, 4)
 
     def test_migration_mode_can_reuse_only_released_weight_room(self):
         standard, _ = _planned_main_entry_shares(

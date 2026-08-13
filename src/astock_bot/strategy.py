@@ -1325,7 +1325,7 @@ def _satellite_entry(
         quote.price,
         risk,
         portfolio_value,
-        _sizing_value(position, position_sizing, "entry_risk_weight", 0.005),
+        float(rules.get("entry_risk_weight", 0.0025)),
         float(rules.get("max_remaining_risk_capacity_fraction", 0.10)),
         _migration_risk_principal(migration_context),
         today,
@@ -1336,6 +1336,7 @@ def _satellite_entry(
         portfolio_value,
         position_sizing,
         migration_context,
+        rules,
     )
     shares = _sized_buy_shares(
         requested=planned_shares,
@@ -1344,7 +1345,9 @@ def _satellite_entry(
         available_cash=available_cash,
         cash_fraction=float(rules.get("max_cash_fraction_per_trade", 0.50)),
         position_weight=position_weight,
-        single_cap=_effective_single_cap(position, position_sizing, risk, migration_context),
+        single_cap=_effective_satellite_cap(
+            position, position_sizing, risk, migration_context
+        ),
         portfolio_value=portfolio_value,
         correlated_weight=correlated_weight,
         correlated_cap=correlated_cap,
@@ -1354,6 +1357,9 @@ def _satellite_entry(
         tech=tech,
     )
     checks = {
+        "no_pending_reduction_or_cooldown": not bool(
+            migration_context.get("satellite_entry_block_reason")
+        ),
         "data_ready": data_ready,
         "industry_and_announcements": evidence_ready,
         "margin_auxiliary_gate": _auxiliary_allows_entry(evidence),
@@ -1387,6 +1393,10 @@ def _satellite_entry(
         "risk_budget": max_risk_amount,
         "planned_weight": planned_weight,
         "current_weight": position_weight,
+        "position_cap": _effective_satellite_cap(
+            position, position_sizing, risk, migration_context
+        ),
+        "entry_block_reason": migration_context.get("satellite_entry_block_reason"),
         "sized_shares": shares,
     }
     if not all(checks.values()):
@@ -2060,6 +2070,31 @@ def _effective_single_cap(
     return standard_cap
 
 
+def _effective_satellite_cap(
+    position: Position,
+    position_sizing: dict,
+    risk: dict,
+    migration_context: dict[str, Any] | None = None,
+) -> float:
+    """Return the temporary total-position cap used by a satellite entry.
+
+    A migrated main position keeps its ratcheting main-position ceiling.  The
+    satellite is a separately risk-budgeted, time-limited overlay, so it may
+    temporarily sit above that ceiling by only the configured overlay amount.
+    Non-migrated holdings retain the ordinary single-name concentration cap.
+    """
+    migration_context = migration_context or {}
+    if not bool(migration_context.get("enabled", False)):
+        return _effective_single_cap(
+            position, position_sizing, risk, migration_context
+        )
+    main_ceiling = float(migration_context.get("position_ceiling", 0.0))
+    overlay = float(
+        migration_context.get("satellite_overlay_max_weight", 0.035)
+    )
+    return max(min(main_ceiling + overlay, 1.0), 0.0)
+
+
 def _planned_main_entry_shares(
     position: Position,
     price: float,
@@ -2113,11 +2148,27 @@ def _planned_satellite_entry_shares(
     portfolio_value: float,
     position_sizing: dict,
     migration_context: dict[str, Any] | None = None,
+    satellite_rules: dict | None = None,
 ) -> tuple[int, float]:
     if price <= 0 or portfolio_value <= 0:
         return 0, 0.0
+    satellite_rules = satellite_rules or {}
     satellite_weight = _sizing_value(position, position_sizing, "satellite_weight", 0.03)
     proportional_shares = _round_down_lot(portfolio_value * satellite_weight / price)
+    # A-share board lots create a sharp discontinuity: a valid one-lot setup
+    # used to become zero merely because 100 shares cost slightly more than the
+    # target weight.  Permit exactly one lot within a small, explicit tolerance;
+    # all cash, issuer, group, stop-risk and liquidity caps still apply later.
+    one_lot_weight = LOT_SIZE * price / portfolio_value
+    one_lot_max_weight = float(
+        satellite_rules.get("one_lot_tolerance_max_weight", satellite_weight)
+    )
+    if (
+        proportional_shares < LOT_SIZE
+        and position.satellite_limit >= LOT_SIZE
+        and one_lot_weight <= one_lot_max_weight
+    ):
+        proportional_shares = LOT_SIZE
     requested = min(proportional_shares, position.satellite_limit)
     return requested, requested * price / portfolio_value
 

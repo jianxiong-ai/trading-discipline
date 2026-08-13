@@ -326,6 +326,7 @@ class MonitorService:
             portfolio_value,
             complete_portfolio_quotes,
             allow_state_update=not dry_run,
+            today=now.date(),
         )
         active_satellite_count = sum(
             1 for position in self.config.positions
@@ -437,6 +438,14 @@ class MonitorService:
                     now.date(),
                     allow_state_update=not dry_run,
                 )
+                migration_context = self._migration_satellite_context(
+                    position,
+                    migration_contexts.get(position.symbol, {}),
+                    stage_memory,
+                    now.date(),
+                )
+                if migration_context:
+                    migration_contexts[position.symbol] = migration_context
                 found = evaluate_position(
                     position, quote, tech, node, peer_change, market_change, now.date(),
                     self.config.section("satellite_rules"), self.config.section("risk"), self.config.holidays,
@@ -451,7 +460,7 @@ class MonitorService:
                     self.config.section("stage_rules"),
                     diagnostics,
                     self.config.section("position_sizing"),
-                    migration_contexts.get(position.symbol, {}),
+                    migration_context,
                     technical_fresh,
                     stage_memory,
                     self.config.section("watchlist_rules"),
@@ -1388,6 +1397,7 @@ class MonitorService:
         portfolio_value: float,
         complete_quotes: bool,
         allow_state_update: bool = True,
+        today=None,
     ) -> tuple[dict[str, dict], dict[str, float]]:
         config = self.config.section("migration_mode")
         if not bool(config.get("enabled", False)):
@@ -1413,9 +1423,9 @@ class MonitorService:
             and portfolio_value > 0
             and all(symbol in quotes for symbol in invested)
         )
-        weights = (
+        main_weights = (
             {
-                symbol: position.total_shares * quotes[symbol].price / portfolio_value
+                symbol: position.main_shares * quotes[symbol].price / portfolio_value
                 for symbol, position in invested.items()
             }
             if valuation_ready
@@ -1438,6 +1448,7 @@ class MonitorService:
             )
             reference_shares = int(current.get("reference_main_shares", position.main_shares))
             ceiling = old_ceiling
+            last_main_reduction_date = current.get("last_main_reduction_date")
             if valuation_ready and position.main_shares < reference_shares:
                 long_term_target = float(
                     position.sizing.get(
@@ -1447,11 +1458,18 @@ class MonitorService:
                 )
                 ceiling = min(
                     ceiling,
-                    max(long_term_target, weights.get(symbol, 0.0) + buffer_weight),
+                    max(long_term_target, main_weights.get(symbol, 0.0) + buffer_weight),
                 )
+                if today is not None:
+                    last_main_reduction_date = today.isoformat()
             updated = {
                 "ceiling_weight": round(ceiling, 8),
                 "reference_main_shares": position.main_shares,
+                **(
+                    {"last_main_reduction_date": last_main_reduction_date}
+                    if last_main_reduction_date
+                    else {}
+                ),
             }
             if valuation_ready and current != updated:
                 position_state[symbol] = updated
@@ -1471,6 +1489,7 @@ class MonitorService:
                     )
                 ),
                 "valuation_ready": valuation_ready,
+                "last_main_reduction_date": last_main_reduction_date,
             }
 
         group_caps: dict[str, float] = {}
@@ -1498,7 +1517,10 @@ class MonitorService:
             )
             ceiling = old_ceiling
             if valuation_ready and reduced:
-                current_weight = sum(weights.get(symbol, 0.0) for symbol in symbols)
+                # A temporary satellite overlay must count against the live
+                # group cap, but must not permanently inflate the ratcheting
+                # migration ceiling when a main-position reduction is recorded.
+                current_weight = sum(main_weights.get(symbol, 0.0) for symbol in symbols)
                 standard_cap = float(group.get("max_ratio", 0.40))
                 ceiling = min(
                     ceiling,
@@ -1519,6 +1541,37 @@ class MonitorService:
         if changed and allow_state_update:
             self.state.save_migration_state(state)
         return contexts, group_caps
+
+    def _migration_satellite_context(
+        self,
+        position,
+        migration_context: dict,
+        stage_memory: dict,
+        today,
+    ) -> dict:
+        """Attach migration-only guards that keep the overlay tactical."""
+        context = dict(migration_context or {})
+        if not bool(context.get("enabled", False)):
+            return context
+        reasons: list[str] = []
+        if bool(context.get("block_satellite_on_pending_reduction", True)):
+            active = self.state.active_signal(position.symbol)
+            if active.get("code") in self._PERSISTENT_REDUCTION_CODES:
+                reasons.append(f"存在待处理{active['code']}减风险信号")
+            if stage_memory.get("top_pending_event_id"):
+                reasons.append("存在尚未确认成交的阶段顶部减仓")
+        last_reduction = context.get("last_main_reduction_date")
+        cooldown_days = int(
+            context.get("satellite_reduction_cooldown_trading_days", 1)
+        )
+        elapsed = self._trading_days_since(last_reduction, today)
+        if last_reduction and elapsed <= cooldown_days:
+            reasons.append(
+                f"主仓减仓后需经过{cooldown_days}个完整交易日冷静期"
+            )
+        context["satellite_reduction_cooldown_elapsed"] = elapsed
+        context["satellite_entry_block_reason"] = "；".join(reasons) or None
+        return context
 
     @staticmethod
     def _evidence_items(evidence) -> list[dict]:

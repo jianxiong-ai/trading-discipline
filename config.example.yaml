@@ -227,6 +227,11 @@ migration_mode:
   enabled: true
   main_add_weight: 0.03
   ratchet_buffer_weight: 0.03
+  # 卫星仓是独立、限时的短线覆盖层：允许临时高于主仓迁移天花板，但最多只多3.5%净值。
+  satellite_overlay_max_weight: 0.035
+  # 待处理减仓期间禁止反向建立卫星仓；确认主仓减仓后再冷静一个完整交易日。
+  block_satellite_on_pending_reduction: true
+  satellite_reduction_cooldown_trading_days: 1
   rebound_trim_weight: 0.03
   rebound_resistance_distance_ratio: 0.01
   rebound_trim_volume_ratio: 1.00
@@ -276,6 +281,10 @@ watchlist_rules:
 
 satellite_rules:
   max_holding_trading_days: 10
+  # 卫星仓单笔止损风险预算独立于主仓新增，最多占账户净值0.25%。
+  entry_risk_weight: 0.0025
+  # 3%目标不足100股时，仅当一手不超过3.5%净值才允许按一手生成计划。
+  one_lot_tolerance_max_weight: 0.035
   support_distance_ratio: 0.008
   minimum_expected_spread_ratio: 0.03
   minimum_reward_risk: 1.80
