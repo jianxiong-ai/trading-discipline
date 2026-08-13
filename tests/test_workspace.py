@@ -27,6 +27,30 @@ class WorkspaceRegistryTests(unittest.TestCase):
             )
             self.assertEqual(len(registry.list()), 2)
 
+    def test_default_has_fixed_password_and_new_workspace_gets_one_time_random_password(self):
+        with TemporaryDirectory() as directory:
+            registry = WorkspaceRegistry(Path(directory) / "data")
+            default = registry.default()
+            created = registry.create()
+
+            self.assertTrue(registry.verify_password(default, "960818"))
+            self.assertFalse(registry.verify_password(default, "960819"))
+            self.assertIsNotNone(created.initial_password)
+            self.assertGreaterEqual(len(created.initial_password or ""), 40)
+            self.assertTrue(registry.verify_password(created, created.initial_password or ""))
+            self.assertNotIn("initial_password", registry.path.read_text(encoding="utf-8"))
+
+    def test_workspace_access_token_is_scoped_to_its_workspace(self):
+        with TemporaryDirectory() as directory:
+            registry = WorkspaceRegistry(Path(directory) / "data")
+            default = registry.default()
+            created = registry.create()
+            token = registry.issue_access_token(default)
+            default = registry.get(default.id)
+
+            self.assertTrue(registry.has_access(default, token))
+            self.assertFalse(registry.has_access(created, token))
+
     def test_local_origin_aliases_are_accepted_but_remote_origin_is_rejected(self):
         self.assertTrue(_origin_matches_request_host("http://localhost:8787", "127.0.0.1:8787"))
         self.assertTrue(_origin_matches_request_host("http://127.0.0.1:8787", "localhost:8787"))

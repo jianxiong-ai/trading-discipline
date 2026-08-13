@@ -59,6 +59,44 @@ def _workspace_config(workspace_id: str):
     return config, _store(config.raw)
 
 
+def _workspace_registry() -> WorkspaceRegistry:
+    return WorkspaceRegistry.from_config_path(_config_path())
+
+
+def _workspace(workspace_id: str):
+    try:
+        return _workspace_registry().get(workspace_id)
+    except WorkspaceError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+def _workspace_is_authorized(request: Request, workspace_id: str) -> bool:
+    workspace = _workspace(workspace_id)
+    return _workspace_registry().has_access(
+        workspace, request.cookies.get("astock_workspace_access")
+    )
+
+
+def _require_workspace_access(request: Request, workspace_id: str):
+    workspace = _workspace(workspace_id)
+    if not _workspace_registry().has_access(
+        workspace, request.cookies.get("astock_workspace_access")
+    ):
+        raise HTTPException(status_code=403, detail="请先输入工作区访问密码")
+    return workspace
+
+
+def _access_context(request: Request, workspace, *, error: str | None = None) -> dict[str, Any]:
+    return {
+        "request": request,
+        "title": "输入工作区密码",
+        "workspace": workspace,
+        "workspace_base": _workspace_base(workspace.id),
+        "csrf_token": _csrf_token(request),
+        "error": error,
+    }
+
+
 def _workspace_base(workspace_id: str) -> str:
     return f"/u/{workspace_id}"
 
@@ -230,6 +268,7 @@ def _context(
         "csrf_token": _csrf_token(request),
         "workspace_id": workspace_id,
         "workspace_base": _workspace_base(workspace_id),
+        "can_create_workspace": bool(raw.get("_workspace_seed_static", False)),
     }
     context.update(extra)
     if "audit_records" in context:
@@ -248,11 +287,15 @@ def _render(request: Request, template: str, context: dict[str, Any]):
     response = templates.TemplateResponse(request, template, context)
     if "astock_csrf" not in request.cookies:
         response.set_cookie("astock_csrf", context["csrf_token"], httponly=True, samesite="strict")
-    # Workspace IDs are local bearer links.  Avoid leaking one in a Referer
-    # header or retaining a private page in a shared browser cache.
+    # Avoid leaking workspace IDs in a Referer header or retaining a private
+    # page in a shared browser cache.
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+def _render_access(request: Request, workspace, *, error: str | None = None):
+    return _render(request, "workspace_access.html", _access_context(request, workspace, error=error))
 
 
 def _origin_matches_request_host(origin: str, host: str) -> bool:
@@ -332,14 +375,56 @@ def root() -> RedirectResponse:
 
 
 @app.post("/workspaces")
-def create_workspace(request: Request, csrf_token: str = Form(...)) -> RedirectResponse:
+def create_workspace(request: Request, csrf_token: str = Form(...)):
     _verify_form(request, csrf_token)
-    workspace = WorkspaceRegistry.from_config_path(_config_path()).create()
-    return RedirectResponse(_workspace_base(workspace.id), status_code=303)
+    registry = _workspace_registry()
+    default = registry.default()
+    if not registry.has_access(default, request.cookies.get("astock_workspace_access")):
+        raise HTTPException(status_code=403, detail="只有默认工作区可以新建工作区")
+    workspace = registry.create()
+    return _render(
+        request,
+        "workspace_created.html",
+        {
+            "request": request,
+            "title": "工作区已创建",
+            "workspace": workspace,
+            "workspace_base": _workspace_base(workspace.id),
+            "csrf_token": _csrf_token(request),
+        },
+    )
+
+
+@app.post("/u/{workspace_id}/access")
+def access_workspace(
+    workspace_id: str,
+    request: Request,
+    password: str = Form(...),
+    csrf_token: str = Form(...),
+):
+    _verify_form(request, csrf_token)
+    workspace = _workspace(workspace_id)
+    registry = _workspace_registry()
+    if not registry.verify_password(workspace, password):
+        return _render_access(request, workspace, error="访问密码不正确")
+    token = registry.issue_access_token(workspace)
+    response = RedirectResponse(_workspace_base(workspace.id), status_code=303)
+    response.set_cookie(
+        "astock_workspace_access",
+        token,
+        httponly=True,
+        samesite="strict",
+        secure=False,
+        path="/",
+    )
+    return response
 
 
 @app.get("/u/{workspace_id}")
 def dashboard(workspace_id: str, request: Request):
+    workspace = _workspace(workspace_id)
+    if not _workspace_is_authorized(request, workspace_id):
+        return _render_access(request, workspace)
     config, store = _workspace_config(workspace_id)
     raw = config.raw
     records = _audit_records(raw)
@@ -352,6 +437,8 @@ def dashboard(workspace_id: str, request: Request):
 
 @app.get("/u/{workspace_id}/positions")
 def positions(workspace_id: str, request: Request):
+    if not _workspace_is_authorized(request, workspace_id):
+        return _render_access(request, _workspace(workspace_id))
     config, store = _workspace_config(workspace_id)
     return _render(request, "positions.html", _context(
         request, config.raw, store, workspace_id=workspace_id, transactions=store.transactions(),
@@ -376,6 +463,7 @@ def create_trade(
     stop_price: str = Form(""),
 ):
     _verify_form(request, csrf_token)
+    _require_workspace_access(request, workspace_id)
     config, store = _workspace_config(workspace_id)
     try:
         store.record_trade(
@@ -406,6 +494,7 @@ def set_available_cash(
     note: str = Form(""),
 ):
     _verify_form(request, csrf_token)
+    _require_workspace_access(request, workspace_id)
     _config, store = _workspace_config(workspace_id)
     try:
         store.set_available_cash(amount=amount, executed_at=executed_at, note=note)
@@ -422,6 +511,7 @@ def reverse_transaction(
     csrf_token: str = Form(...),
 ):
     _verify_form(request, csrf_token)
+    _require_workspace_access(request, workspace_id)
     config, store = _workspace_config(workspace_id)
     try:
         store.reverse_transaction(transaction_id)
@@ -432,6 +522,8 @@ def reverse_transaction(
 
 @app.get("/u/{workspace_id}/watchlist")
 def watchlist(workspace_id: str, request: Request):
+    if not _workspace_is_authorized(request, workspace_id):
+        return _render_access(request, _workspace(workspace_id))
     config, store = _workspace_config(workspace_id)
     raw = config.raw
     records = _audit_records(raw)
@@ -459,6 +551,7 @@ def add_watchlist(
     peers: str = Form(""),
 ):
     _verify_form(request, csrf_token)
+    _require_workspace_access(request, workspace_id)
     config, store = _workspace_config(workspace_id)
     raw = config.raw
     try:
@@ -485,6 +578,7 @@ def add_watchlist(
 @app.post("/u/{workspace_id}/watchlist/{symbol}/remove")
 def remove_watchlist(workspace_id: str, symbol: str, request: Request, csrf_token: str = Form(...)):
     _verify_form(request, csrf_token)
+    _require_workspace_access(request, workspace_id)
     _config, store = _workspace_config(workspace_id)
     try:
         store.remove_watchlist(symbol)
@@ -495,6 +589,8 @@ def remove_watchlist(workspace_id: str, symbol: str, request: Request, csrf_toke
 
 @app.get("/u/{workspace_id}/notifications")
 def notifications(workspace_id: str, request: Request):
+    if not _workspace_is_authorized(request, workspace_id):
+        return _render_access(request, _workspace(workspace_id))
     config, store = _workspace_config(workspace_id)
     raw = config.raw
     context = _context(request, raw, store, workspace_id=workspace_id)
@@ -514,6 +610,7 @@ def save_notification_settings(
     min_confidence: str = Form("中"),
 ):
     _verify_form(request, csrf_token)
+    _require_workspace_access(request, workspace_id)
     config, store = _workspace_config(workspace_id)
     try:
         store.save_notification_settings(webhook=webhook, min_confidence=min_confidence, raw=config.raw)
@@ -525,6 +622,7 @@ def save_notification_settings(
 @app.post("/u/{workspace_id}/notifications/test")
 def test_notification_settings(workspace_id: str, request: Request, csrf_token: str = Form(...)):
     _verify_form(request, csrf_token)
+    _require_workspace_access(request, workspace_id)
     config, store = _workspace_config(workspace_id)
     settings = store.notification_settings(config.raw, include_secrets=True)
     if not settings.get("webhook"):

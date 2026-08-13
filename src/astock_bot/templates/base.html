@@ -16,7 +16,7 @@
           <a class="{{ 'active' if request.url.path == workspace_base ~ '/positions' else '' }}" href="{{ workspace_base }}/positions">持仓</a>
           <a class="{{ 'active' if request.url.path == workspace_base ~ '/watchlist' else '' }}" href="{{ workspace_base }}/watchlist">股票池</a>
           <a class="{{ 'active' if request.url.path == workspace_base ~ '/notifications' else '' }}" href="{{ workspace_base }}/notifications">消息配置</a>
-          <form method="post" action="/workspaces" class="workspace-create"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">新建工作区</button></form>
+          {% if can_create_workspace %}<form method="post" action="/workspaces" class="workspace-create"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">新建工作区</button></form>{% endif %}
         </nav>
       </div>
     </header>

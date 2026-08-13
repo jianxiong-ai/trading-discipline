@@ -21,6 +21,44 @@ nav .workspace-create button {
 }
 nav .workspace-create button:hover { color: var(--accent); border-color: var(--accent); }
 
+.workspace-gate {
+  align-items: center;
+  display: flex;
+  justify-content: center;
+  min-height: 78vh;
+  padding: 24px 16px;
+}
+.workspace-gate-card {
+  box-sizing: border-box;
+  max-width: 460px;
+  width: 100%;
+}
+.workspace-gate-card > p:not(.eyebrow):not(.field-note) { color: var(--sub); line-height: 1.65; }
+.workspace-gate-card .form-grid { margin-top: 20px; }
+.workspace-secret {
+  align-items: center;
+  background: var(--wash);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: flex;
+  gap: 14px;
+  justify-content: space-between;
+  margin: 22px 0 14px;
+  padding: 14px;
+}
+.workspace-secret span { color: var(--sub); font-size: 12px; }
+.workspace-secret code { color: var(--accent); font-size: 15px; overflow-wrap: anywhere; }
+.button-link {
+  background: var(--accent);
+  border-radius: 6px;
+  color: white;
+  display: inline-block;
+  font-size: 13px;
+  margin-top: 12px;
+  padding: 10px 14px;
+  text-decoration: none;
+}
+
 .settings-layout {
   display: grid;
   grid-template-columns: minmax(0, 1.35fr) minmax(260px, .65fr);

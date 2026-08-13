@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title }}</title>
+    <link rel="stylesheet" href="/static/styles.css?v={{ asset_version }}">
+    <link rel="stylesheet" href="/static/workspace.css?v={{ asset_version }}">
+  </head>
+  <body>
+    <main class="workspace-gate">
+      <section class="panel workspace-gate-card">
+        <p class="eyebrow">WORKSPACE ACCESS</p>
+        <h1>输入访问密码</h1>
+        <p>此工作区受密码保护，请输入密码后继续访问。</p>
+        {% if error %}<div class="flash error">{{ error }}</div>{% endif %}
+        <form method="post" action="{{ workspace_base }}/access" class="form-grid">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <label class="full">访问密码<input name="password" type="password" autocomplete="current-password" autofocus required></label>
+          <button class="full" type="submit">进入工作区</button>
+        </form>
+      </section>
+    </main>
+  </body>
+</html>

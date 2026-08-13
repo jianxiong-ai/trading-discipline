@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title }}</title>
+    <link rel="stylesheet" href="/static/styles.css?v={{ asset_version }}">
+    <link rel="stylesheet" href="/static/workspace.css?v={{ asset_version }}">
+  </head>
+  <body>
+    <main class="workspace-gate">
+      <section class="panel workspace-gate-card">
+        <p class="eyebrow">WORKSPACE CREATED</p>
+        <h1>工作区已创建</h1>
+        <p>请保存下面的访问密码。出于安全考虑，密码只在此页面展示。</p>
+        <div class="workspace-secret"><span>访问密码</span><code>{{ workspace.initial_password }}</code></div>
+        <p class="field-note">工作区链接：<a href="{{ workspace_base }}">{{ workspace_base }}</a></p>
+        <a class="button-link" href="{{ workspace_base }}">前往工作区</a>
+      </section>
+    </main>
+  </body>
+</html>
