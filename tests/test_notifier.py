@@ -113,6 +113,21 @@ class NotifierTests(unittest.TestCase):
         self.assertIn("计划目标价 11.00", text)
         self.assertIn("将role改为holding", text)
 
+    def test_watchlist_near_entry_is_explicitly_non_actionable(self):
+        signal = Signal(
+            symbol="600487.SH", name="亨通光电", code="WATCH_NEAR_ENTRY", confidence="中",
+            price=56.51, key_level=55.30, action="临界机会观察，暂不建仓", shares=0,
+            reason="技术与外部证据已就绪，但目标空间与风险预算尚未通过",
+            invalidation="剩余门槛通过前不下单",
+            event_id="watch-near-entry", category="observation",
+            details={"change_pct": 3.86, "target": 58.18, "stop": 49.75},
+        )
+        text = render_message([signal], "10:15", "A股持仓纪律")
+        self.assertIn("建议：临界机会观察，暂不建仓", text)
+        self.assertIn("级别：提醒（非买卖指令）", text)
+        self.assertIn("计划目标价 58.18", text)
+        self.assertNotIn("0股", text)
+
     def test_margin_evidence_is_rendered_on_its_own_line_without_body_truncation(self):
         signal = Signal(
             symbol="601336.SH", name="新华保险", code="DOWN_BREAK", confidence="中",

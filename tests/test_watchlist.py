@@ -107,6 +107,110 @@ class WatchlistTests(unittest.TestCase):
         self.assertEqual(signals[0].details["entry_setup"], "breakout_confirmed")
         self.assertAlmostEqual(signals[0].details["planned_nav_ratio"], 0.0458, places=4)
 
+    def test_bottom_breakout_transition_uses_next_valid_resistance(self):
+        transition = tech(
+            support=53.68, resistance=57.18, vwap=57.52, volume_ratio=1.22,
+            close=58.70, previous=58.00, open_=58.10, last_low=57.20,
+            next_resistance=86.39, atr14=4.7371,
+            rsi14=46.78, previous_rsi14=36.78, rsi_min_5=17.82,
+            ma20_slope_5d=-0.1191, range_position_60=0.1657,
+            recent_high_60=124.888, recent_low_60=46.0,
+        )
+        diagnostics = {}
+        signals = evaluate_position(
+            watchlist_position(symbol="600487.SH", name="亨通光电"),
+            quote(58.74, symbol="600487.SH", name="亨通光电"),
+            transition, "10:15", 0.01, 0.01, date(2026, 8, 7),
+            {},
+            {"max_loss_ratio": 0.25, "warning_ratio": 0.20, "max_single_position_ratio": 0.30},
+            set(), 100000, 0.0, 190000, None, None,
+            {"minimum_strong_confirmations": 2, "minimum_ma20_slope_5d": 0.0},
+            0, equity_evidence(1), {}, diagnostics,
+            {"watchlist_initial_weight": 0.05, "watchlist_entry_risk_weight": 0.0035},
+            {}, True, {},
+            {
+                "minimum_strong_confirmations": 2,
+                "minimum_expected_spread_ratio": 0.05,
+                "minimum_reward_risk": 2.0,
+                "maximum_target_distance_ratio": 0.50,
+                "maximum_target_atr_multiple": 8.0,
+            },
+        )
+        self.assertEqual([signal.code for signal in signals], ["WATCH_ENTRY"])
+        self.assertEqual(signals[0].details["entry_setup"], "bottom_breakout_transition")
+        self.assertEqual(signals[0].details["target"], 86.39)
+        self.assertEqual(signals[0].shares, 100)
+        self.assertGreater(signals[0].details["reward_risk"], 4.0)
+        self.assertTrue(
+            diagnostics["checks"]["watchlist_entry"]["target_scale_sane"]["passed"]
+        )
+
+    def test_transition_rejects_implausibly_distant_target(self):
+        transition = tech(
+            support=53.68, resistance=57.18, vwap=57.52, volume_ratio=1.22,
+            close=58.70, previous=58.00, open_=58.10, last_low=57.20,
+            next_resistance=100.0, atr14=4.7371,
+            rsi14=46.78, previous_rsi14=36.78, rsi_min_5=17.82,
+            ma20_slope_5d=-0.1191, range_position_60=0.1657,
+            recent_high_60=124.888, recent_low_60=46.0,
+        )
+        diagnostics = {}
+        signals = evaluate_position(
+            watchlist_position(), quote(58.74), transition, "10:15", 0.01, 0.01,
+            date(2026, 8, 7), {},
+            {"max_loss_ratio": 0.25, "warning_ratio": 0.20, "max_single_position_ratio": 0.30},
+            set(), 100000, 0.0, 190000, None, None,
+            {"minimum_strong_confirmations": 2, "minimum_ma20_slope_5d": 0.0},
+            0, equity_evidence(1), {}, diagnostics,
+            {"watchlist_initial_weight": 0.05, "watchlist_entry_risk_weight": 0.0035},
+            {}, True, {},
+            {
+                "minimum_strong_confirmations": 2,
+                "minimum_expected_spread_ratio": 0.05,
+                "minimum_reward_risk": 2.0,
+                "maximum_target_distance_ratio": 0.50,
+                "maximum_target_atr_multiple": 8.0,
+            },
+        )
+        self.assertFalse(any(signal.code == "WATCH_ENTRY" for signal in signals))
+        self.assertFalse(
+            diagnostics["checks"]["watchlist_entry"]["target_scale_sane"]["passed"]
+        )
+
+    def test_near_entry_reminder_is_non_actionable_and_groups_blockers(self):
+        near = tech(
+            support=51.03, resistance=55.30, vwap=54.83, volume_ratio=2.22,
+            close=56.40, previous=55.50, open_=55.80, last_low=55.20,
+            next_resistance=58.18, atr14=4.975,
+            rsi14=36.78, previous_rsi14=25.0, rsi_min_5=17.82,
+            ma20_slope_5d=-0.1318, range_position_60=0.1376,
+            recent_high_60=124.888, recent_low_60=46.0,
+        )
+        signals = evaluate_position(
+            watchlist_position(), quote(56.51), near, "10:15", 0.01, 0.01,
+            date(2026, 8, 6), {},
+            {"max_loss_ratio": 0.25, "warning_ratio": 0.20, "max_single_position_ratio": 0.30},
+            set(), 100000, 0.0, 180000, None, None,
+            {"minimum_strong_confirmations": 2, "minimum_ma20_slope_5d": 0.0},
+            0, equity_evidence(1), {}, {},
+            {"watchlist_initial_weight": 0.05, "watchlist_entry_risk_weight": 0.0035},
+            {}, True, {},
+            {
+                "minimum_strong_confirmations": 2,
+                "minimum_expected_spread_ratio": 0.05,
+                "minimum_reward_risk": 2.0,
+                "maximum_target_distance_ratio": 0.50,
+                "maximum_target_atr_multiple": 8.0,
+                "notify_near_entry": True,
+                "near_entry_max_blocker_groups": 2,
+            },
+        )
+        self.assertEqual([signal.code for signal in signals], ["WATCH_NEAR_ENTRY"])
+        self.assertEqual(signals[0].shares, 0)
+        self.assertTrue(signals[0].details["informational_only"])
+        self.assertIn("暂不建仓", signals[0].action)
+        self.assertIn("不足100股", signals[0].reason)
+
     def test_watchlist_uses_stricter_spread_than_existing_main_add(self):
         narrow = tech(
             support=39, resistance=41, vwap=40, volume_ratio=1.5,
@@ -124,7 +228,7 @@ class WatchlistTests(unittest.TestCase):
             {}, True, {},
             {"minimum_expected_spread_ratio": 0.05, "minimum_reward_risk": 2.0},
         )
-        self.assertEqual(signals, [])
+        self.assertFalse(any(signal.code == "WATCH_ENTRY" for signal in signals))
         self.assertFalse(
             diagnostics["checks"]["watchlist_entry"]["minimum_expected_spread"]["passed"]
         )

@@ -55,7 +55,7 @@ def render_message(
         evidence = str(signal.details.get("evidence") or "").strip()
         if evidence and signal.code in {
             "UP_BREAK", "DOWN_BREAK", "SAT_BUY", "STAGE_REENTRY", "STAGE_TOP_EXIT",
-            "MIGRATION_TRIM", "FALSE_BREAK", "WATCH_ENTRY",
+            "MIGRATION_TRIM", "FALSE_BREAK", "WATCH_ENTRY", "WATCH_NEAR_ENTRY",
         }:
             evidence_body, margin_evidence, capital_evidence, holder_evidence = (
                 _partition_auxiliary_evidence(evidence)
@@ -89,13 +89,15 @@ def render_message(
                 )
             if evidence_lines:
                 lines.extend(["", "【证据】", *evidence_lines])
-        if signal.code == "OVERHEAT_WATCH":
+        if signal.code in {"OVERHEAT_WATCH", "WATCH_NEAR_ENTRY"}:
             lines.extend(["", "级别：提醒（非买卖指令）"])
         references = []
         if "target" in signal.details:
             if signal.code == "SAT_BUY":
                 label = "计划止盈价"
-            elif signal.code in {"UP_BREAK", "STAGE_REENTRY", "WATCH_ENTRY"}:
+            elif signal.code in {
+                "UP_BREAK", "STAGE_REENTRY", "WATCH_ENTRY", "WATCH_NEAR_ENTRY",
+            }:
                 label = "计划目标价"
             else:
                 label = "原计划止盈价"

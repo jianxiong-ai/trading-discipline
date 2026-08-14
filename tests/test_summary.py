@@ -138,6 +138,28 @@ class DailySummaryTests(unittest.TestCase):
         self.assertIn("暂停首次建仓", MonitorService._summary_recommendation(summary, "watchlist"))
         self.assertIn("负向证据", MonitorService._summary_reason(summary))
 
+    def test_near_entry_reminder_is_not_counted_as_an_action_signal(self):
+        with TemporaryDirectory() as directory:
+            service = MonitorService(self._config(Path(directory)))
+            record = self._record("2026-07-29T10:15:07+08:00", "10:15", "scheduled")
+            record["summaries"][0].update({
+                "role": "watchlist", "support": 39.8, "resistance": 42.0,
+                "stage": {"label": "BOTTOM_CONFIRMED"},
+            })
+            record["signals"] = [{
+                "symbol": "600362.SH",
+                "code": "WATCH_NEAR_ENTRY",
+                "action": "临界机会观察，暂不建仓",
+                "reason": "目标空间与一手风险预算尚未同时通过",
+                "details": {"notification_status": "sent", "informational_only": True},
+            }]
+            row = service._daily_summary_rows([record])[0]
+            self.assertEqual(row["trigger_count"], 0)
+            self.assertEqual(row["candidate_count"], 0)
+            self.assertEqual(row["informational_count"], 1)
+            self.assertEqual(row["recommendation"], "临界机会观察，暂不建仓")
+            self.assertIn("风险预算", row["reason"])
+
     @staticmethod
     def _record(timestamp, node, execution_type=None):
         record = {

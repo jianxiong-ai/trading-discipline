@@ -841,24 +841,42 @@ class MonitorService:
                 if latest.get(key) is None and baseline.get(key) is not None:
                     latest[key] = baseline[key]
             latest_status = str(latest.get("status", "DATA_MISSING"))
-            actionable_signals = [
+            informational_codes = {"OVERHEAT_WATCH", "WATCH_NEAR_ENTRY"}
+            routed_signals = [
                 signal for signal in signals
                 if (signal.get("details") or {}).get("notification_status")
                 in {None, "sent", "would_send", "candidate"}
             ]
+            actionable_signals = [
+                signal for signal in routed_signals
+                if signal.get("code") not in informational_codes
+            ]
+            informational_signals = [
+                signal for signal in routed_signals
+                if signal.get("code") in informational_codes
+            ]
+            action_candidates = [
+                signal for signal in signals
+                if signal.get("code") not in informational_codes
+            ]
+            reason_override = None
             if actionable_signals:
                 signal = actionable_signals[-1]
                 shares = int(signal.get("shares", 0) or 0)
                 share_text = f" {shares}股" if shares else ""
                 recommendation = f"复核今日规则生成的“{signal.get('action', '纪律动作')}{share_text}”；未确认成交前不视为已执行"
-            elif signals:
-                reason = (signals[-1].get("details") or {}).get("suppression_reason", "组合择优或通知门控")
+            elif action_candidates:
+                reason = (action_candidates[-1].get("details") or {}).get("suppression_reason", "组合择优或通知门控")
                 recommendation = f"今日曾出现候选动作，但已被{reason}抑制，不作为执行建议"
+            elif informational_signals:
+                signal = informational_signals[-1]
+                recommendation = str(signal.get("action") or "临界机会观察，暂不操作")
+                reason_override = str(signal.get("reason") or "仅作观察提醒，不构成买卖指令")
             elif latest_status in {"DATA_MISSING", "STALE"}:
                 recommendation = "暂不操作，等待行情与证据恢复"
             else:
                 recommendation = self._summary_recommendation(latest, position.role)
-            reason = self._summary_reason(latest)
+            reason = reason_override or self._summary_reason(latest)
             rows.append({
                 "symbol": position.symbol,
                 "name": position.name,
@@ -867,7 +885,8 @@ class MonitorService:
                 "recommendation": recommendation,
                 "reason": reason,
                 "trigger_count": len(actionable_signals),
-                "candidate_count": len(signals),
+                "candidate_count": len(action_candidates),
+                "informational_count": len(informational_signals),
                 "latest_node": latest_node,
                 "stage": latest.get("stage", {}),
                 "role": position.role,
@@ -986,6 +1005,12 @@ class MonitorService:
                     blockers.append("20日线仍明显下行")
                 if entry.get("breakout_persistence") is False:
                     blockers.append("15分钟突破持续/回踩未确认")
+                if failed("watchlist_entry", "target_scale_sane"):
+                    target_distance = ratio_text(entry.get("target_distance_ratio"))
+                    blockers.append(
+                        f"下一压力跨度{target_distance}需复核复权/历史尺度"
+                        if target_distance else "下一压力需复核复权/历史尺度"
+                    )
                 breakout_spread = entry.get("breakout_expected_spread")
                 if breakout_spread is None and summary.get("next_resistance") is not None:
                     next_resistance = float(summary["next_resistance"])
@@ -1033,6 +1058,8 @@ class MonitorService:
                     blockers.append("产业/公告证据不足")
                 if failed("watchlist_entry", "external_confirmation"):
                     blockers.append("同行与市场确认不足")
+                if failed("watchlist_entry", "target_scale_sane"):
+                    blockers.append("下一压力的复权/历史尺度需复核")
                 if failed("watchlist_entry", "minimum_expected_spread"):
                     blockers.append("目标空间不足")
                 if failed("watchlist_entry", "minimum_reward_risk"):
@@ -1288,6 +1315,8 @@ class MonitorService:
             return 2, signal.symbol
         if signal.code == "OVERHEAT_WATCH":
             return 3, signal.symbol
+        if signal.code == "WATCH_NEAR_ENTRY":
+            return 4, signal.symbol
         return 2, signal.symbol
 
     def _technical_data_fresh(self, tech, quote, now: datetime) -> tuple[bool, list[str]]:

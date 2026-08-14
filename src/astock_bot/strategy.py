@@ -361,6 +361,17 @@ def _watchlist_entry_signal(
         and above_vwap
     )
 
+    # A bottom confirmation can complete after price has already crossed the
+    # current resistance.  Treat that overlap as its own setup instead of
+    # keeping the now-stale resistance as the target or forcing the slower
+    # MA20 trend gate used by a standalone breakout.
+    bottom_breakout_transition = bool(
+        bottom_setup
+        and price_above_resistance
+        and close_above_resistance
+        and breakout_persistent
+    )
+
     breakout_target = tech.next_resistance
     breakout_stop = tech.resistance * (
         1 - float(strategic_rules.get("breakout_stop_buffer_ratio", 0.01))
@@ -383,7 +394,17 @@ def _watchlist_entry_signal(
         else -1.0
     )
 
-    if bottom_setup:
+    plain_bottom_setup = bool(bottom_setup and quote.price < tech.resistance)
+    if bottom_breakout_transition:
+        setup = "bottom_breakout_transition"
+        level = round(tech.resistance, 2)
+        target = tech.next_resistance
+        stop, _ = _adaptive_stop(tech, rules)
+        reason = (
+            "观察标的磨底右侧确认后，完整15分钟已突破并守住当前压力；"
+            "按高于现价的下一有效压力评估首次学习型起始仓"
+        )
+    elif plain_bottom_setup:
         setup = "bottom_confirmed"
         level = round(tech.support, 2)
         target = tech.resistance
@@ -409,6 +430,10 @@ def _watchlist_entry_signal(
         target = None
         stop = tech.support
         reason = ""
+
+    target_sane, target_distance_ratio, target_atr_multiple = _watchlist_target_sanity(
+        quote.price, target, tech, watchlist_rules
+    )
 
     expected_spread = (
         (target - quote.price) / quote.price
@@ -449,11 +474,12 @@ def _watchlist_entry_signal(
     )
     checks = {
         "role_is_watchlist": position.role == "watchlist",
-        "setup_confirmed": bottom_setup or breakout_setup,
+        "setup_confirmed": plain_bottom_setup or bottom_breakout_transition or breakout_setup,
         "industry_and_announcements": evidence_ready,
         "margin_auxiliary_gate": _auxiliary_allows_entry(evidence),
         "external_confirmation": external_ready,
         "not_near_stage_top": stage_allows,
+        "target_scale_sane": target_sane,
         "minimum_expected_spread": expected_spread >= float(
             watchlist_rules.get("minimum_expected_spread_ratio", 0.05)
         ),
@@ -471,12 +497,16 @@ def _watchlist_entry_signal(
         "reward_risk": reward_risk,
         "target": target,
         "stop": stop,
+        "target_scale_sane": target_sane,
+        "target_distance_ratio": target_distance_ratio,
+        "target_atr_multiple": target_atr_multiple,
         "risk_budget": risk_amount,
         "planned_weight": planned_weight,
         "sized_shares": shares,
         "volume_mode": volume_mode,
         "above_vwap": above_vwap,
         "bottom_confirmed": bool(stage.get("bottom_confirmed")),
+        "bottom_breakout_transition": bottom_breakout_transition,
         "breakout_intraday_confirmed": intraday_confirmed,
         "breakout_persistence": breakout_persistent,
         "price_above_resistance": price_above_resistance,
@@ -496,6 +526,26 @@ def _watchlist_entry_signal(
         ),
     }
     if not all(checks.values()):
+        near_signal = _watchlist_near_entry_signal(
+            position=position,
+            quote=quote,
+            today=today,
+            setup=setup,
+            level=level,
+            target=target,
+            stop=stop,
+            expected_spread=expected_spread,
+            reward_risk=reward_risk,
+            shares=shares,
+            checks=checks,
+            watchlist_rules=watchlist_rules,
+            evidence=evidence,
+            stage=stage,
+            target_distance_ratio=target_distance_ratio,
+            target_atr_multiple=target_atr_multiple,
+        )
+        if near_signal:
+            return near_signal
         return None
 
     confidence = "高" if strong_count >= 3 else "中"
@@ -539,6 +589,125 @@ def _watchlist_entry_signal(
             **_liquidity_details(tech, shares, liquidity_rules),
             "planned_nav_ratio": round(shares * quote.price / portfolio_value, 4)
             if portfolio_value else 0.0,
+        },
+    )
+
+
+def _watchlist_target_sanity(
+    price: float,
+    target: float | None,
+    tech: Technicals,
+    watchlist_rules: dict,
+) -> tuple[bool, float | None, float | None]:
+    """Reject stale or scale-mismatched targets before they drive an entry."""
+    if target is None or price <= 0 or target <= price:
+        return False, None, None
+    distance_ratio = (target - price) / price
+    atr_multiple = (
+        (target - price) / tech.atr14
+        if tech.atr14 is not None and tech.atr14 > 0
+        else None
+    )
+    max_distance = float(
+        watchlist_rules.get("maximum_target_distance_ratio", 0.50)
+    )
+    max_atr = float(
+        watchlist_rules.get("maximum_target_atr_multiple", 8.0)
+    )
+    within_recent_range = bool(
+        tech.recent_high_60 is None
+        or target <= tech.recent_high_60 * 1.001
+    )
+    return (
+        distance_ratio <= max_distance
+        and (atr_multiple is None or atr_multiple <= max_atr)
+        and within_recent_range,
+        distance_ratio,
+        atr_multiple,
+    )
+
+
+def _watchlist_near_entry_signal(
+    *,
+    position,
+    quote,
+    today,
+    setup: str,
+    level: float,
+    target: float | None,
+    stop: float,
+    expected_spread: float,
+    reward_risk: float,
+    shares: int,
+    checks: dict[str, bool],
+    watchlist_rules: dict,
+    evidence,
+    stage: dict,
+    target_distance_ratio: float | None,
+    target_atr_multiple: float | None,
+) -> Signal | None:
+    """Send a non-action reminder only when the qualitative setup is ready."""
+    if not bool(watchlist_rules.get("notify_near_entry", True)):
+        return None
+    foundation = (
+        "setup_confirmed",
+        "industry_and_announcements",
+        "margin_auxiliary_gate",
+        "external_confirmation",
+        "not_near_stage_top",
+    )
+    if not all(checks.get(name, False) for name in foundation):
+        return None
+
+    blockers: list[str] = []
+    if not checks.get("target_scale_sane", False):
+        distance = (
+            f"{target_distance_ratio:.1%}"
+            if target_distance_ratio is not None else "不可计算"
+        )
+        atr_text = (
+            f"、约{target_atr_multiple:.1f}倍ATR"
+            if target_atr_multiple is not None else ""
+        )
+        blockers.append(f"下一压力跨度{distance}{atr_text}，需复核复权/历史尺度")
+    if not (
+        checks.get("minimum_expected_spread", False)
+        and checks.get("minimum_reward_risk", False)
+    ):
+        spread_text = f"{expected_spread:.1%}" if expected_spread >= 0 else "不足"
+        rr_text = f"{reward_risk:.2f}" if reward_risk >= 0 else "不足"
+        blockers.append(f"目标空间{spread_text}、收益风险比{rr_text}尚未同时达标")
+    if not checks.get("sized_at_least_one_lot", False):
+        blockers.append("按止损风险预算不足100股")
+
+    max_groups = int(watchlist_rules.get("near_entry_max_blocker_groups", 2))
+    if not blockers or len(blockers) > max_groups:
+        return None
+    target_details = {"target": round(float(target), 2)} if target is not None else {}
+    return Signal(
+        symbol=position.symbol,
+        name=position.name,
+        code="WATCH_NEAR_ENTRY",
+        confidence="中",
+        price=quote.price,
+        key_level=level,
+        action="临界机会观察，暂不建仓",
+        shares=0,
+        reason="观察仓的技术与外部证据已就绪，但" + "；".join(blockers),
+        invalidation="剩余门槛通过前不下单；结构、证据或风险收益恶化则取消临界观察",
+        event_id=f"{today.isoformat()}|{position.symbol}:WATCH_NEAR_ENTRY",
+        category="observation",
+        details={
+            **target_details,
+            "stop": round(stop, 2),
+            "reward_risk": round(reward_risk, 2),
+            "expected_spread": round(expected_spread, 4),
+            "sized_shares": shares,
+            "evidence": _evidence_note(evidence),
+            "stage": stage.get("label"),
+            "entry_setup": setup,
+            "informational_only": True,
+            "event_rank": 0,
         },
     )
 

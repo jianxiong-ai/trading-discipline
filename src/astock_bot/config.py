@@ -586,12 +586,27 @@ def _validate_config(raw: dict[str, Any], positions: list[Position]) -> None:
         ("minimum_expected_spread_ratio", 0.05),
         ("minimum_reward_risk", 2.0),
         ("max_cash_fraction_per_entry", 1.0),
+        ("maximum_target_distance_ratio", 0.50),
     ):
         value = float(watchlist.get(key, default))
         if not 0 < value <= 1 and key != "minimum_reward_risk":
             raise ValueError(f"watchlist_rules.{key} 必须在(0, 1]之间")
         if key == "minimum_reward_risk" and value <= 0:
             raise ValueError("watchlist_rules.minimum_reward_risk 必须大于0")
+    maximum_target_atr = float(
+        watchlist.get("maximum_target_atr_multiple", 8.0)
+    )
+    if not 0 < maximum_target_atr <= 20:
+        raise ValueError(
+            "watchlist_rules.maximum_target_atr_multiple 必须在(0, 20]之间"
+        )
+    near_entry_blockers = int(
+        watchlist.get("near_entry_max_blocker_groups", 2)
+    )
+    if not 1 <= near_entry_blockers <= 3:
+        raise ValueError(
+            "watchlist_rules.near_entry_max_blocker_groups 必须在[1, 3]之间"
+        )
     watch_confirmations = int(watchlist.get("minimum_strong_confirmations", 2))
     if not 2 <= watch_confirmations <= 4:
         raise ValueError("watchlist_rules.minimum_strong_confirmations 必须在[2, 4]之间")

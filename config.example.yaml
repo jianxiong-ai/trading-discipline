@@ -277,6 +277,10 @@ watchlist_rules:
   market_minimum: -0.005
   minimum_expected_spread_ratio: 0.05
   minimum_reward_risk: 2.00
+  maximum_target_distance_ratio: 0.50
+  maximum_target_atr_multiple: 8.0
+  notify_near_entry: true
+  near_entry_max_blocker_groups: 2
   max_cash_fraction_per_entry: 1.00
 
 satellite_rules:
