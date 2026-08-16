@@ -122,6 +122,27 @@ class MigrationStateTests(unittest.TestCase):
             self.assertFalse(state_file.exists())
             self.assertEqual(service.state.migration_state()["positions"], {})
 
+    def test_recovery_anchor_is_frozen_before_later_reductions(self):
+        with TemporaryDirectory() as folder:
+            state_file = Path(folder) / "state.json"
+            quotes = {
+                "600362.SH": make_quote("600362.SH", 60),
+                "601318.SH": make_quote("601318.SH", 50),
+            }
+            initial = MonitorService(self._config(state_file, 1000))
+            contexts, _ = initial._migration_contexts(quotes, 100000, True)
+            self.assertEqual(
+                contexts["600362.SH"]["recovery_anchor_price"], 70.0
+            )
+
+            reduced = MonitorService(self._config(state_file, 900))
+            contexts, _ = reduced._migration_contexts(quotes, 94000, True)
+            self.assertEqual(
+                contexts["600362.SH"]["recovery_anchor_price"], 70.0
+            )
+            stored = reduced.state.migration_state()["positions"]["600362.SH"]
+            self.assertEqual(stored["recovery_anchor_price"], 70.0)
+
     def test_position_ratchet_uses_main_shares_and_records_satellite_cooldown(self):
         with TemporaryDirectory() as folder:
             state_file = Path(folder) / "state.json"

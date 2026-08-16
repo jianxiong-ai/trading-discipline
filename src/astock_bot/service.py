@@ -22,6 +22,7 @@ from .strategy import evaluate_position, overheat_watch_signal
 class MonitorService:
     _PERSISTENT_REDUCTION_CODES = {
         "EMERGENCY_RISK", "DOWN_BREAK", "STAGE_TOP_EXIT", "MIGRATION_TRIM",
+        "MIGRATION_RECOVERY_TRIM",
         "SAT_EXIT", "SAT_SELL",
     }
 
@@ -482,6 +483,7 @@ class MonitorService:
                     found = [resolved]
                 exit_codes = {
                     "DOWN_BREAK", "STAGE_TOP_EXIT", "MIGRATION_TRIM",
+                    "MIGRATION_RECOVERY_TRIM",
                     "SAT_EXIT", "SAT_SELL", "EMERGENCY_RISK",
                 }
                 if (
@@ -1170,7 +1172,8 @@ class MonitorService:
 
         result.extend(signal for signal in unique if signal.category == "risk")
         exit_codes = {
-            "DOWN_BREAK", "STAGE_TOP_EXIT", "MIGRATION_TRIM", "SAT_EXIT", "SAT_SELL",
+            "DOWN_BREAK", "STAGE_TOP_EXIT", "MIGRATION_TRIM",
+            "MIGRATION_RECOVERY_TRIM", "SAT_EXIT", "SAT_SELL",
         }
         for category in ("strategy", "satellite", "reminder"):
             category_signals = [signal for signal in unique if signal.category == category]
@@ -1218,6 +1221,7 @@ class MonitorService:
             return None
         blocking_codes = {
             "DOWN_BREAK", "EMERGENCY_RISK", "STAGE_TOP_EXIT", "MIGRATION_TRIM",
+            "MIGRATION_RECOVERY_TRIM",
             "SAT_EXIT", "SAT_SELL",
         }
         if any(signal.code in blocking_codes for signal in current_signals):
@@ -1309,7 +1313,10 @@ class MonitorService:
     def _signal_priority(signal: Signal) -> tuple[int, str]:
         if signal.code == "EMERGENCY_RISK":
             return 0, signal.symbol
-        if signal.code in {"DOWN_BREAK", "STAGE_TOP_EXIT", "MIGRATION_TRIM", "SAT_EXIT", "SAT_SELL"}:
+        if signal.code in {
+            "DOWN_BREAK", "STAGE_TOP_EXIT", "MIGRATION_TRIM",
+            "MIGRATION_RECOVERY_TRIM", "SAT_EXIT", "SAT_SELL",
+        }:
             return 1, signal.symbol
         if signal.code == "FALSE_BREAK":
             return 2, signal.symbol
@@ -1478,6 +1485,21 @@ class MonitorService:
             reference_shares = int(current.get("reference_main_shares", position.main_shares))
             ceiling = old_ceiling
             last_main_reduction_date = current.get("last_main_reduction_date")
+            configured_recovery_anchor = settings.get("recovery_anchor_price")
+            stored_recovery_anchor = float(
+                current.get("recovery_anchor_price", 0.0) or 0.0
+            )
+            if configured_recovery_anchor not in (None, ""):
+                recovery_anchor_price = float(configured_recovery_anchor)
+            elif stored_recovery_anchor > 0:
+                recovery_anchor_price = stored_recovery_anchor
+            elif position.main_shares > 0 and position.economic_basis > 0:
+                # Freeze the cycle break-even line before later sells lower the
+                # residual economic basis. An explicit per-position override is
+                # available for ledgers first connected after a partial sale.
+                recovery_anchor_price = position.economic_basis / position.main_shares
+            else:
+                recovery_anchor_price = 0.0
             if valuation_ready and position.main_shares < reference_shares:
                 long_term_target = float(
                     position.sizing.get(
@@ -1495,6 +1517,11 @@ class MonitorService:
                 "ceiling_weight": round(ceiling, 8),
                 "reference_main_shares": position.main_shares,
                 **(
+                    {"recovery_anchor_price": round(recovery_anchor_price, 8)}
+                    if recovery_anchor_price > 0
+                    else {}
+                ),
+                **(
                     {"last_main_reduction_date": last_main_reduction_date}
                     if last_main_reduction_date
                     else {}
@@ -1511,6 +1538,7 @@ class MonitorService:
                 "enabled": True,
                 "position_ceiling": ceiling,
                 "risk_principal_ceiling": float(settings["risk_principal_ceiling"]),
+                "recovery_anchor_price": recovery_anchor_price,
                 "long_term_target_weight": float(
                     position.sizing.get(
                         "target_main_weight",

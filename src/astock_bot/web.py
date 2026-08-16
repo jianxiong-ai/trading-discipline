@@ -251,6 +251,25 @@ def _context(
 ) -> dict[str, Any]:
     snapshot = store.snapshot(raw)
     positions = snapshot["positions"]
+    global_sizing = raw.get("position_sizing", {})
+    global_target = float(global_sizing.get("target_main_weight", 0.20))
+    global_single_cap = float(global_sizing.get("max_single_position_weight", 0.30))
+    portfolio_single_cap = _portfolio_single_position_cap(raw)
+    for item in positions:
+        sizing = dict(item.get("sizing") or {})
+        target_override = sizing.get("target_main_weight")
+        single_cap_override = sizing.get("max_single_position_weight")
+        target = global_target if target_override is None else float(target_override)
+        single_cap = (
+            global_single_cap
+            if single_cap_override is None
+            else float(single_cap_override)
+        )
+        item["target_main_weight_pct"] = round(target * 100, 4)
+        item["target_main_weight_is_override"] = target_override is not None
+        item["max_single_position_weight_pct"] = round(single_cap * 100, 4)
+        item["max_single_position_weight_is_override"] = single_cap_override is not None
+        item["portfolio_single_position_cap_pct"] = round(portfolio_single_cap * 100, 4)
     holdings = [item for item in positions if item.get("role") == "holding"]
     watchlist = [item for item in positions if item.get("role") == "watchlist"]
     context = {
@@ -446,6 +465,41 @@ def positions(workspace_id: str, request: Request):
     return _render(request, "positions.html", _context(
         request, config.raw, store, workspace_id=workspace_id, transactions=store.transactions(),
     ))
+
+
+@app.post("/u/{workspace_id}/positions/{symbol}/target-weight")
+def set_position_target_weight(
+    workspace_id: str,
+    symbol: str,
+    request: Request,
+    csrf_token: str = Form(...),
+    target_weight_pct: float = Form(...),
+    max_single_position_weight_pct: float = Form(...),
+):
+    _verify_form(request, csrf_token)
+    _require_workspace_access(request, workspace_id)
+    config, store = _workspace_config(workspace_id)
+    position = next((item for item in config.positions if item.symbol == symbol.upper()), None)
+    if position is None or position.role != "holding":
+        return _redirect(workspace_id, "/positions", error="找不到该正式持仓")
+    portfolio_cap = _portfolio_single_position_cap(config.raw)
+    try:
+        store.set_position_weight_limits(
+            symbol=symbol,
+            target_main_weight=target_weight_pct / 100,
+            max_single_position_weight=max_single_position_weight_pct / 100,
+            portfolio_max_weight=portfolio_cap,
+        )
+    except PortfolioStoreError as exc:
+        return _redirect(workspace_id, "/positions", error=str(exc))
+    return _redirect(
+        workspace_id,
+        "/positions",
+        notice=(
+            f"{position.name}长期目标已更新为{target_weight_pct:g}%，"
+            f"单股上限已更新为{max_single_position_weight_pct:g}%"
+        ),
+    )
 
 
 @app.post("/u/{workspace_id}/trades")
@@ -645,3 +699,7 @@ def _optional_number(value: str) -> float | None:
         return float(value)
     except ValueError as exc:
         raise PortfolioStoreError("价格字段必须是有效数字") from exc
+
+
+def _portfolio_single_position_cap(raw: dict[str, Any]) -> float:
+    return float(raw.get("risk", {}).get("max_single_position_ratio", 0.45))

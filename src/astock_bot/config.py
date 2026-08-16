@@ -245,6 +245,7 @@ def _validate_position(position: Position) -> None:
             "enabled",
             "initial_ceiling_weight",
             "risk_principal_ceiling",
+            "recovery_anchor_price",
         }
         unknown_migration_keys = set(position.migration) - allowed_migration_keys
         if unknown_migration_keys:
@@ -262,6 +263,13 @@ def _validate_position(position: Position) -> None:
                 raise ValueError(
                     f"{position.symbol} migration.risk_principal_ceiling 必须大于0"
                 )
+            recovery_anchor = position.migration.get("recovery_anchor_price")
+            if recovery_anchor not in (None, ""):
+                recovery_anchor_value = float(recovery_anchor)
+                if not math.isfinite(recovery_anchor_value) or recovery_anchor_value <= 0:
+                    raise ValueError(
+                        f"{position.symbol} migration.recovery_anchor_price 必须大于0"
+                    )
     if position.satellite.active:
         if (
             position.satellite.shares <= 0
@@ -398,6 +406,46 @@ def _validate_config(raw: dict[str, Any], positions: list[Position]) -> None:
             raise ValueError(
                 "migration_mode.satellite_reduction_cooldown_trading_days 不得小于0"
             )
+        if bool(migration.get("recovery_trim_enabled", True)):
+            for key, default in (
+                ("recovery_trim_cost_buffer_ratio", 0.005),
+                ("recovery_trim_target_buffer_weight", 0.03),
+            ):
+                value = float(migration.get(key, default))
+                if not math.isfinite(value) or not 0 <= value < 1:
+                    raise ValueError(f"migration_mode.{key} 必须在[0, 1)之间")
+            rsi_min = float(migration.get("recovery_trim_rsi_min", 70.0))
+            if not math.isfinite(rsi_min) or not 0 <= rsi_min <= 100:
+                raise ValueError("migration_mode.recovery_trim_rsi_min 必须在[0, 100]之间")
+            for key, default in (
+                ("recovery_trim_atr_extension_min", 3.0),
+                ("recovery_trim_breakout_volume_ratio", 1.30),
+            ):
+                value = float(migration.get(key, default))
+                if not math.isfinite(value) or value <= 0:
+                    raise ValueError(f"migration_mode.{key} 必须大于0")
+            target_buffer = float(
+                migration.get("recovery_trim_target_buffer_weight", 0.03)
+            )
+            for position in positions:
+                if not bool(position.migration.get("enabled", False)):
+                    continue
+                target_weight = float(
+                    position.sizing.get(
+                        "target_main_weight", effective_sizing["target_main_weight"]
+                    )
+                )
+                if target_weight + target_buffer > 1:
+                    raise ValueError(
+                        f"{position.symbol} 长期目标与回本减仓缓冲之和不得高于1"
+                    )
+                anchor = position.migration.get("recovery_anchor_price")
+                if anchor not in (None, ""):
+                    anchor_value = float(anchor)
+                    if not math.isfinite(anchor_value) or anchor_value <= 0:
+                        raise ValueError(
+                            f"{position.symbol} migration.recovery_anchor_price 必须大于0"
+                        )
         groups = migration.get("correlation_groups", {})
         known_groups = set(risk.get("correlation_groups", {}))
         if set(groups) - known_groups:

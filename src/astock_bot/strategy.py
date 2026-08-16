@@ -13,6 +13,7 @@ LOT_SIZE = 100
 # 和卫星止损/到期退出均优先。缺失证据不构成“弱势”本身。
 _RECORD_DATE_BLOCKED_CODES = {
     "MIGRATION_TRIM",
+    "MIGRATION_RECOVERY_TRIM",
     "SAT_SELL",
 }
 
@@ -176,8 +177,10 @@ def evaluate_position(
         execution_constraints=execution_constraints,
         liquidity_rules=liquidity_rules,
     )
-    if strategic and strategic.code in {"DOWN_BREAK", "STAGE_TOP_EXIT", "MIGRATION_TRIM"}:
-        if strategic.code == "MIGRATION_TRIM" and _is_record_date(position, today):
+    if strategic and strategic.code in {
+        "DOWN_BREAK", "STAGE_TOP_EXIT", "MIGRATION_TRIM", "MIGRATION_RECOVERY_TRIM",
+    }:
+        if strategic.code in _RECORD_DATE_BLOCKED_CODES and _is_record_date(position, today):
             _check(
                 diagnostics,
                 "corporate_event",
@@ -838,6 +841,29 @@ def _strategic_signal(
             top_signal.details["satellite_exit_shares"] = position.satellite.shares
         return top_signal
 
+    recovery_trim = (
+        _migration_recovery_trim_signal(
+            position,
+            quote,
+            tech,
+            today,
+            evidence,
+            position_weight,
+            portfolio_value,
+            migration_context,
+            stage,
+            diagnostics,
+            liquidity_rules,
+        )
+        if position.main_shares > 0
+        else None
+    )
+    if recovery_trim:
+        if position.satellite.active:
+            recovery_trim.action = "先退出卫星仓，再执行超配仓回本降风险"
+            recovery_trim.details["satellite_exit_shares"] = position.satellite.shares
+        return recovery_trim
+
     migration_trim = (
         _migration_rebound_trim_signal(
             position,
@@ -1273,6 +1299,203 @@ def _stage_top_signal(position, quote, tech, today, stage, stage_rules, evidence
             "full_exit": full_exit,
             "top_trim_stage": int(stage.get("top_trim_stage", 0) or 0) + 1,
             "top_trim_rearmed": bool(stage.get("top_trim_rearmed", True)),
+        },
+    )
+
+
+def _migration_recovery_trim_signal(
+    position,
+    quote,
+    tech,
+    today,
+    evidence,
+    position_weight,
+    portfolio_value,
+    migration_context,
+    stage,
+    diagnostics,
+    liquidity_rules,
+):
+    """Reduce a materially overweight legacy holding after it recovers its cycle cost.
+
+    Cost recovery is only a gate, never a forecast.  The action also requires
+    technical overheat or rejection, and a verified strong breakout with
+    improving company evidence suppresses the trim.
+    """
+    if not bool(migration_context.get("enabled", False)) or not bool(
+        migration_context.get("recovery_trim_enabled", True)
+    ):
+        return None
+
+    anchor_price = float(migration_context.get("recovery_anchor_price", 0.0) or 0.0)
+    cost_buffer = float(migration_context.get("recovery_trim_cost_buffer_ratio", 0.005))
+    recovery_price = anchor_price * (1 + cost_buffer)
+    long_term_target = float(migration_context.get("long_term_target_weight", 0.20))
+    target_buffer = float(
+        migration_context.get("recovery_trim_target_buffer_weight", 0.03)
+    )
+    retained_target_weight = min(long_term_target + target_buffer, 1.0)
+    data_ready = _intraday_data_ready(tech, migration_context)
+    valuation_ready = bool(
+        migration_context.get("valuation_ready", portfolio_value > 0)
+        and portfolio_value > 0
+    )
+
+    atr_extension = stage.get("atr_extension")
+    rsi_overheated = bool(
+        tech.rsi14 is not None
+        and tech.rsi14 >= float(migration_context.get("recovery_trim_rsi_min", 70.0))
+    )
+    atr_overheated = bool(
+        atr_extension is not None
+        and float(atr_extension) >= float(
+            migration_context.get("recovery_trim_atr_extension_min", 3.0)
+        )
+    )
+    failed_break = bool(
+        tech.last_15m_high is not None
+        and tech.last_15m_close is not None
+        and tech.last_15m_high >= tech.resistance
+        and tech.last_15m_close < tech.resistance
+    )
+    bearish_reversal = bool(
+        tech.last_15m_open is not None
+        and tech.last_15m_close is not None
+        and tech.previous_15m_close is not None
+        and tech.last_15m_close < tech.last_15m_open
+        and tech.last_15m_close < tech.previous_15m_close
+    )
+    below_vwap = bool(tech.vwap is not None and quote.price < tech.vwap)
+    rejection = failed_break or bearish_reversal or below_vwap
+    overheat_or_rejection = rsi_overheated or atr_overheated or rejection
+
+    industry_improving = bool(
+        evidence
+        and evidence.industry_status == "fresh"
+        and evidence.industry_direction is not None
+        and evidence.industry_direction > 0
+        and evidence.industry_strength >= 2
+    )
+    company_improving = bool(
+        evidence
+        and (
+            (
+                evidence.company_status == "fresh"
+                and evidence.company_direction is not None
+                and evidence.company_direction > 0
+            )
+            or evidence.corporate_action_confirmation
+        )
+    )
+    strong_breakout = bool(
+        data_ready
+        and tech.last_15m_close is not None
+        and tech.last_15m_close > tech.resistance
+        and quote.price > tech.resistance
+        and tech.vwap is not None
+        and quote.price > tech.vwap
+        and tech.volume_ratio is not None
+        and tech.volume_ratio >= float(
+            migration_context.get("recovery_trim_breakout_volume_ratio", 1.30)
+        )
+        and industry_improving
+        and company_improving
+    )
+
+    target_main_shares = (
+        _round_down_lot(portfolio_value * retained_target_weight / quote.price)
+        if valuation_ready and quote.price > 0
+        else 0
+    )
+    if position.main_shares >= LOT_SIZE:
+        # This rule reduces concentration; it must not turn into a thesis-free
+        # full exit merely because the target value rounds below one board lot.
+        target_main_shares = max(target_main_shares, LOT_SIZE)
+    desired_shares = _round_down_lot(
+        max(position.main_shares - target_main_shares, 0)
+    )
+    shares = min(position.main_shares, desired_shares)
+    if bool(liquidity_rules.get("enabled", False)):
+        shares = min(
+            shares,
+            _adv_capacity(tech, liquidity_rules, "max_routine_trim_adv_ratio"),
+        )
+
+    checks = {
+        "fixed_recovery_anchor_available": anchor_price > 0,
+        "above_recovery_price": anchor_price > 0 and quote.price >= recovery_price,
+        "materially_overweight": position_weight > retained_target_weight,
+        "portfolio_valuation_ready": valuation_ready,
+        "data_ready": data_ready,
+        "overheat_or_rejection": overheat_or_rejection,
+        "strong_breakout_not_confirmed": not strong_breakout,
+        "sized_at_least_one_lot": shares >= LOT_SIZE,
+    }
+    for name, passed in checks.items():
+        _check(diagnostics, "migration_recovery_trim", name, passed)
+    diagnostics.setdefault("metrics", {})["migration_recovery_trim"] = {
+        "recovery_anchor_price": anchor_price,
+        "recovery_price": recovery_price,
+        "cost_buffer_ratio": cost_buffer,
+        "current_weight": position_weight,
+        "long_term_target_weight": long_term_target,
+        "retained_target_weight": retained_target_weight,
+        "target_main_shares": target_main_shares,
+        "desired_reduction_shares": desired_shares,
+        "sized_shares": shares,
+        "rsi_overheated": rsi_overheated,
+        "atr_overheated": atr_overheated,
+        "failed_break": failed_break,
+        "bearish_reversal": bearish_reversal,
+        "below_vwap": below_vwap,
+        "strong_breakout": strong_breakout,
+    }
+    if not all(checks.values()):
+        return None
+
+    condition_text: list[str] = []
+    if rsi_overheated:
+        condition_text.append(f"RSI{float(tech.rsi14):.0f}过热")
+    if atr_overheated:
+        condition_text.append(f"偏离MA20约{float(atr_extension):.2f}个ATR")
+    if rejection:
+        condition_text.append("15分钟冲高受阻或回到分时均价下方")
+    level = round(recovery_price, 2)
+    confidence = "高" if rejection and (rsi_overheated or atr_overheated) else "中"
+    return Signal(
+        symbol=position.symbol,
+        name=position.name,
+        code="MIGRATION_RECOVERY_TRIM",
+        confidence=confidence,
+        price=quote.price,
+        key_level=level,
+        action="超配仓回本后降低主仓至长期目标附近",
+        shares=shares,
+        reason=(
+            f"存量主仓占比{position_weight:.1%}，显著高于长期目标{long_term_target:.1%}；"
+            f"股价已超过本轮固定回本线{recovery_price:.2f}；"
+            f"{'、'.join(condition_text)}。成本线只作为降集中度窗口，不用于预测后续涨跌"
+        ),
+        invalidation=(
+            f"价格重新低于{recovery_price:.2f}，或放量站稳动态压力且产业与公司证据同步增强"
+        ),
+        event_id=(
+            f"{today.isoformat()}|{position.symbol}:MIGRATION_RECOVERY_TRIM:"
+            f"{recovery_price:.2f}:{retained_target_weight:.4f}"
+        ),
+        category="strategy",
+        details={
+            "evidence": _evidence_note(evidence),
+            "planned_nav_ratio": round(shares * quote.price / portfolio_value, 4),
+            "migration": True,
+            "event_rank": 2 if confidence == "高" else 1,
+            "position_main_shares": position.main_shares,
+            "recovery_anchor_price": round(anchor_price, 4),
+            "recovery_price": round(recovery_price, 4),
+            "current_weight": round(position_weight, 4),
+            "retained_target_weight": round(retained_target_weight, 4),
+            "desired_reduction_shares": desired_shares,
+            **_liquidity_details(tech, shares, liquidity_rules),
         },
     )
 

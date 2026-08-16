@@ -669,6 +669,133 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(signals[0].shares, 100)
         self.assertTrue(diagnostics["checks"]["migration_trim"]["rebound_rejection"]["passed"])
 
+    def test_overweight_recovered_migration_position_trims_to_target_buffer(self):
+        august_seventh = tech(
+            support=45.71,
+            resistance=47.85,
+            vwap=48.39,
+            volume_ratio=1.57,
+            close=49.50,
+            previous=49.30,
+            open_=49.20,
+            atr14=2.95,
+            rsi14=70.96,
+            previous_rsi14=69.0,
+            rsi_max_5=70.96,
+            range_position_60=0.704,
+            recent_high_60=54.57,
+        )
+        diagnostics = {}
+        signals = evaluate_position(
+            position(), quote(49.50), august_seventh, "14:15", 0.01, 0.005,
+            date(2026, 8, 7), {},
+            {"max_loss_ratio": 0.99, "warning_ratio": 0.90},
+            set(), 100000, 0.471, 189000, None, None, {}, 0,
+            equity_evidence(0), {}, diagnostics, {},
+            {
+                "enabled": True,
+                "position_ceiling": 0.4285,
+                "long_term_target_weight": 0.20,
+                "recovery_anchor_price": 87720 / 1800,
+                "recovery_trim_enabled": True,
+                "recovery_trim_cost_buffer_ratio": 0.005,
+                "recovery_trim_target_buffer_weight": 0.03,
+                "recovery_trim_rsi_min": 70,
+                "recovery_trim_atr_extension_min": 3.0,
+                "recovery_trim_breakout_volume_ratio": 1.30,
+                "minimum_volume_baseline_samples": 3,
+            },
+        )
+        self.assertEqual([signal.code for signal in signals], ["MIGRATION_RECOVERY_TRIM"])
+        self.assertEqual(signals[0].shares, 1000)
+        self.assertAlmostEqual(signals[0].details["retained_target_weight"], 0.23)
+        self.assertTrue(
+            diagnostics["checks"]["migration_recovery_trim"]
+            ["above_recovery_price"]["passed"]
+        )
+        self.assertTrue(
+            diagnostics["metrics"]["migration_recovery_trim"]["atr_overheated"]
+        )
+
+    def test_recovery_cost_cross_alone_does_not_trigger_migration_trim(self):
+        not_overheated = tech(
+            support=45.71,
+            resistance=51.0,
+            vwap=49.0,
+            volume_ratio=1.0,
+            close=49.50,
+            previous=49.40,
+            open_=49.30,
+            atr14=10.0,
+            rsi14=55.0,
+            previous_rsi14=54.0,
+            range_position_60=0.60,
+            recent_high_60=60.0,
+        )
+        diagnostics = {}
+        signals = evaluate_position(
+            position(), quote(49.50), not_overheated, "14:15", 0.01, 0.005,
+            date(2026, 8, 7), {},
+            {"max_loss_ratio": 0.99, "warning_ratio": 0.90},
+            set(), 100000, 0.471, 189000, None, None, {}, 0,
+            equity_evidence(0), {}, diagnostics, {},
+            {
+                "enabled": True,
+                "long_term_target_weight": 0.20,
+                "recovery_anchor_price": 87720 / 1800,
+                "recovery_trim_enabled": True,
+                "recovery_trim_cost_buffer_ratio": 0.005,
+                "recovery_trim_target_buffer_weight": 0.03,
+                "recovery_trim_rsi_min": 70,
+                "recovery_trim_atr_extension_min": 3.0,
+                "minimum_volume_baseline_samples": 3,
+            },
+        )
+        self.assertEqual(signals, [])
+        self.assertFalse(
+            diagnostics["checks"]["migration_recovery_trim"]
+            ["overheat_or_rejection"]["passed"]
+        )
+
+    def test_verified_strong_breakout_blocks_recovery_trim(self):
+        breakout = tech(
+            support=45.71,
+            resistance=47.85,
+            vwap=48.39,
+            volume_ratio=1.57,
+            close=49.50,
+            previous=49.30,
+            open_=49.20,
+            atr14=2.95,
+            rsi14=70.96,
+            previous_rsi14=69.0,
+            range_position_60=0.704,
+            recent_high_60=54.57,
+        )
+        diagnostics = {}
+        signals = evaluate_position(
+            position(), quote(49.50), breakout, "14:15", 0.01, 0.005,
+            date(2026, 8, 7), {},
+            {"max_loss_ratio": 0.99, "warning_ratio": 0.90},
+            set(), 100000, 0.471, 189000, None, None, {}, 0,
+            equity_evidence(1, company_direction=1), {}, diagnostics, {},
+            {
+                "enabled": True,
+                "long_term_target_weight": 0.20,
+                "recovery_anchor_price": 87720 / 1800,
+                "recovery_trim_enabled": True,
+                "recovery_trim_cost_buffer_ratio": 0.005,
+                "recovery_trim_target_buffer_weight": 0.03,
+                "recovery_trim_breakout_volume_ratio": 1.30,
+                "minimum_volume_baseline_samples": 3,
+            },
+        )
+        self.assertEqual(signals, [])
+        self.assertFalse(
+            diagnostics["checks"]["migration_recovery_trim"]
+            ["strong_breakout_not_confirmed"]["passed"]
+        )
+
     def test_migration_trim_does_not_treat_missing_industry_as_weak(self):
         rejected = tech(
             support=39, resistance=42, vwap=42.0, volume_ratio=1.2,

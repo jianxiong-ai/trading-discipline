@@ -232,6 +232,14 @@ migration_mode:
   # 待处理减仓期间禁止反向建立卫星仓；确认主仓减仓后再冷静一个完整交易日。
   block_satellite_on_pending_reduction: true
   satellite_reduction_cooldown_trading_days: 1
+  # 超配存量仓回到本轮固定成本线之上且出现过热/受阻时，直接把超配部分降至长期目标+3%。
+  # 成本线只是风险迁移窗口；放量突破且产业、公司证据同步增强时不减仓。
+  recovery_trim_enabled: true
+  recovery_trim_cost_buffer_ratio: 0.005
+  recovery_trim_target_buffer_weight: 0.03
+  recovery_trim_rsi_min: 70
+  recovery_trim_atr_extension_min: 3.0
+  recovery_trim_breakout_volume_ratio: 1.30
   rebound_trim_weight: 0.03
   rebound_resistance_distance_ratio: 0.01
   rebound_trim_volume_ratio: 1.00
@@ -369,6 +377,8 @@ portfolio:
         enabled: true
         initial_ceiling_weight: 0.42855855
         risk_principal_ceiling: 87720.00
+        # 可选显式锚点；未填时首次完整估值会按当时经济投入/主仓股数冻结。
+        recovery_anchor_price: 48.73333333
       peers: [601899.SH, 000630.SZ, 000878.SZ]
       satellite:
         active: false

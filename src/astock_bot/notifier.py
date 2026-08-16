@@ -55,7 +55,8 @@ def render_message(
         evidence = str(signal.details.get("evidence") or "").strip()
         if evidence and signal.code in {
             "UP_BREAK", "DOWN_BREAK", "SAT_BUY", "STAGE_REENTRY", "STAGE_TOP_EXIT",
-            "MIGRATION_TRIM", "FALSE_BREAK", "WATCH_ENTRY", "WATCH_NEAR_ENTRY",
+            "MIGRATION_TRIM", "MIGRATION_RECOVERY_TRIM", "FALSE_BREAK",
+            "WATCH_ENTRY", "WATCH_NEAR_ENTRY",
         }:
             evidence_body, margin_evidence, capital_evidence, holder_evidence = (
                 _partition_auxiliary_evidence(evidence)

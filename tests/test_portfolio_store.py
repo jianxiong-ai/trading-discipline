@@ -3,7 +3,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from astock_bot.portfolio_store import PortfolioStore
+from astock_bot.portfolio_store import PortfolioStore, PortfolioStoreError
 
 
 def portfolio() -> dict:
@@ -28,6 +28,55 @@ def portfolio() -> dict:
 
 
 class PortfolioStoreTests(unittest.TestCase):
+    def test_position_weight_limits_are_persisted_and_preserve_other_sizing(self):
+        with TemporaryDirectory() as directory:
+            store = PortfolioStore(Path(directory) / "portfolio.db")
+            raw = {"portfolio": portfolio()}
+            raw["portfolio"]["positions"][0]["sizing"] = {"trend_add_weight": 0.05}
+            store.ensure_seed(raw["portfolio"])
+
+            store.set_position_weight_limits(
+                symbol="600362.SH",
+                target_main_weight=0.18,
+                max_single_position_weight=0.25,
+                portfolio_max_weight=0.30,
+            )
+            # A later YAML change must not be masked by the seeded DB copy.
+            raw["portfolio"]["positions"][0]["sizing"]["trend_add_weight"] = 0.06
+
+            sizing = store.snapshot(raw)["positions"][0]["sizing"]
+            self.assertEqual(sizing["target_main_weight"], 0.18)
+            self.assertEqual(sizing["max_single_position_weight"], 0.25)
+            self.assertEqual(sizing["trend_add_weight"], 0.06)
+
+    def test_target_main_weight_must_not_exceed_single_position_cap(self):
+        with TemporaryDirectory() as directory:
+            store = PortfolioStore(Path(directory) / "portfolio.db")
+            raw = {"portfolio": portfolio()}
+            store.ensure_seed(raw["portfolio"])
+
+            with self.assertRaisesRegex(PortfolioStoreError, "不得高于单股仓位上限"):
+                store.set_position_weight_limits(
+                    symbol="600362.SH",
+                    target_main_weight=0.26,
+                    max_single_position_weight=0.25,
+                    portfolio_max_weight=0.30,
+                )
+
+    def test_single_position_cap_must_respect_portfolio_cap(self):
+        with TemporaryDirectory() as directory:
+            store = PortfolioStore(Path(directory) / "portfolio.db")
+            raw = {"portfolio": portfolio()}
+            store.ensure_seed(raw["portfolio"])
+
+            with self.assertRaisesRegex(PortfolioStoreError, "不得超过账户级上限30%"):
+                store.set_position_weight_limits(
+                    symbol="600362.SH",
+                    target_main_weight=0.20,
+                    max_single_position_weight=0.31,
+                    portfolio_max_weight=0.30,
+                )
+
     def test_notification_subscriptions_encrypt_webhook_and_deduplicate_scope(self):
         with TemporaryDirectory() as directory, patch.dict("os.environ", {"NOTIFICATION_ENCRYPTION_KEY": "test-key"}):
             store = PortfolioStore(Path(directory) / "portfolio.db")

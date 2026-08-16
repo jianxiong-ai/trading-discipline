@@ -3,8 +3,38 @@
 <section class="page-title"><div><p class="eyebrow">POSITIONS</p><h1>持仓与成交</h1><p>成交需确认；分红按交易所实施公告在发放日收盘后自动入账。</p></div></section>
 <section class="layout-main positions-layout">
   <article class="panel"><div class="section-head"><div><p class="eyebrow">CURRENT</p><h2>正式持仓</h2></div></div>
-  <div class="table-wrap"><table><thead><tr><th>标的</th><th>主仓</th><th>卫星仓</th><th>经济投入</th><th>卫星计划</th></tr></thead><tbody>
-  {% for p in holdings %}<tr><td><b>{{ p.name }}</b><br><small>{{ p.symbol }}</small></td><td>{{ p.main_shares }}股</td><td>{% if p.satellite.active %}{{ p.satellite.shares }}股{% else %}—{% endif %}</td><td>¥{{ '%.2f'|format(p.economic_basis) }}</td><td>{% if p.satellite.active %}<small>目标 {{ p.satellite.target_price }}<br>退出 {{ p.satellite.stop_price or '未设' }}</small>{% else %}<small>未启用</small>{% endif %}</td></tr>{% else %}<tr><td colspan="5">尚无正式持仓。可先在“股票池”加入标的、校准可用资金后，再录入已成交的首次建仓。</td></tr>{% endfor %}
+  <div class="table-wrap"><table class="positions-table"><thead><tr><th>标的</th><th class="num">主仓</th><th class="num">卫星仓</th><th class="num">经济投入</th><th>仓位纪律<small>净资产占比</small></th></tr></thead><tbody>
+  {% for p in holdings %}
+  <tr>
+    <td><b>{{ p.name }}</b><br><small>{{ p.symbol }}</small></td>
+    <td class="num">{{ p.main_shares }}股</td>
+    <td class="num">{% if p.satellite.active %}<b>{{ p.satellite.shares }}股</b><br><small>目标 {{ p.satellite.target_price }} · 退出 {{ p.satellite.stop_price or '未设' }}</small>{% else %}—<br><small>未启用</small>{% endif %}</td>
+    <td class="num">¥{{ '%.2f'|format(p.economic_basis) }}</td>
+    <td>
+      {% set weight_meta = '目标' ~ ('单股设置' if p.target_main_weight_is_override else '继承全局') ~ ' · 上限' ~ ('单股设置' if p.max_single_position_weight_is_override else '继承全局') ~ ' · 账户硬上限' ~ ('%g'|format(p.portfolio_single_position_cap_pct)) ~ '%' %}
+      <details class="weight-editor">
+        <summary aria-label="编辑{{ p.name }}仓位纪律">
+          <span class="weight-view-item"><small>目标</small><b>{{ p.target_main_weight_pct }}%</b></span>
+          <span class="weight-view-item"><small>上限</small><b>{{ p.max_single_position_weight_pct }}%</b></span>
+          <span class="weight-edit">编辑</span>
+          <small class="weight-limit-meta">{{ weight_meta }}</small>
+        </summary>
+        <form method="post" action="{{ workspace_base }}/positions/{{ p.symbol }}/target-weight" class="target-weight-form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <div class="weight-limit-fields">
+            <label><small>目标</small><span><input aria-label="{{ p.name }}长期目标仓位" name="target_weight_pct" type="number" min="0.01" max="{{ p.portfolio_single_position_cap_pct }}" step="0.01" value="{{ p.target_main_weight_pct }}" required><i>%</i></span></label>
+            <label><small>上限</small><span><input aria-label="{{ p.name }}单股仓位上限" name="max_single_position_weight_pct" type="number" min="0.01" max="{{ p.portfolio_single_position_cap_pct }}" step="0.01" value="{{ p.max_single_position_weight_pct }}" required><i>%</i></span></label>
+          </div>
+          <div class="weight-actions">
+            <button type="submit">保存</button>
+            <button class="weight-cancel" type="reset" onclick="this.closest('details').open = false">取消</button>
+          </div>
+          <small class="weight-limit-meta">{{ weight_meta }}</small>
+        </form>
+      </details>
+    </td>
+  </tr>
+  {% else %}<tr><td colspan="5">尚无正式持仓。可先在“股票池”加入标的、校准可用资金后，再录入已成交的首次建仓。</td></tr>{% endfor %}
   </tbody></table></div>
   </article>
 <aside class="panel form-panel sticky"><p class="eyebrow">CONFIRM</p><h2>录入已成交</h2><form method="post" action="{{ workspace_base }}/trades" class="form-grid"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">

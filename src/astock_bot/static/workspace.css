@@ -131,8 +131,164 @@ nav .workspace-create button:hover { color: var(--accent); border-color: var(--a
 }
 .modal-close:hover { background: var(--wash); color: var(--ink); }
 
+.positions-layout { grid-template-columns: minmax(0, 1.7fr) minmax(280px, .7fr); }
+.positions-layout .table-wrap table,
+.positions-table { width: 100%; min-width: 0; }
+.positions-table th.num,
+.positions-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.positions-table th > small {
+  display: block;
+  color: #9aa39f;
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+.positions-table td { vertical-align: middle; }
+.weight-editor {
+  border: 0;
+  margin: 0;
+  min-width: 210px;
+}
+.weight-editor > summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 4px 12px;
+  align-items: end;
+  list-style: none;
+  cursor: pointer;
+  padding: 2px 0;
+  color: var(--ink);
+  font-size: 14px;
+}
+.weight-editor > summary::-webkit-details-marker { display: none; }
+.weight-view-item { display: grid; gap: 2px; min-width: 0; }
+.weight-view-item small {
+  color: var(--sub);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .02em;
+}
+.weight-view-item b {
+  font-size: 16px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -.02em;
+  line-height: 1.2;
+}
+.weight-edit {
+  display: inline-flex;
+  align-items: center;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--paper);
+  color: var(--sub);
+  font-size: 12px;
+  font-weight: 700;
+}
+.weight-editor > summary:hover .weight-edit {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.weight-editor[open] > summary { display: none; }
+.weight-editor .weight-limit-meta { grid-column: 1 / -1; }
+.target-weight-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px 10px;
+  align-items: end;
+  margin: 0;
+  min-width: 228px;
+  padding: 10px;
+  background: var(--wash);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.weight-limit-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.weight-limit-fields label {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.weight-limit-fields label > small {
+  color: var(--sub);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .02em;
+}
+.weight-limit-fields span {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  height: 32px;
+  padding-right: 8px;
+  background: var(--paper);
+  border: 1px solid #cfd7d3;
+  border-radius: 7px;
+}
+.weight-limit-fields span:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.target-weight-form input {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  padding: 6px 2px 6px 8px;
+  outline: none;
+  appearance: textfield;
+}
+.target-weight-form input[type=number]::-webkit-inner-spin-button,
+.target-weight-form input[type=number]::-webkit-outer-spin-button {
+  appearance: none;
+  margin: 0;
+}
+.target-weight-form i {
+  color: var(--sub);
+  font-size: 11px;
+  font-style: normal;
+}
+.weight-actions { display: grid; gap: 6px; }
+.target-weight-form button {
+  height: 32px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 7px;
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 750;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.target-weight-form button:hover { filter: brightness(1.06); }
+.target-weight-form .weight-cancel {
+  background: #eef1ef;
+  color: var(--ink);
+}
+.target-weight-form .weight-cancel:hover { filter: none; background: #e4e8e5; }
+.target-weight-form > .weight-limit-meta,
+.weight-editor .weight-limit-meta {
+  color: var(--sub);
+  font-size: 10px;
+  line-height: 1.45;
+}
+.target-weight-form > .weight-limit-meta { grid-column: 1 / -1; }
+
 @media (max-width: 720px) {
   .settings-layout { grid-template-columns: 1fr; }
   nav .workspace-create { display: none; }
   .cash-value { justify-content: flex-start; }
+  .weight-editor,
+  .target-weight-form { min-width: 0; }
 }

@@ -308,6 +308,15 @@ class PortfolioStore:
             for key in _DYNAMIC_KEYS:
                 if key in record:
                     item[key] = record[key]
+            # Seed records can contain an old copy of YAML sizing. Only merge
+            # the explicit UI override, so later YAML changes to other sizing
+            # keys keep taking effect.
+            sizing_overrides = record.get("sizing_overrides")
+            if isinstance(sizing_overrides, dict):
+                item["sizing"] = {
+                    **dict(item.get("sizing") or {}),
+                    **sizing_overrides,
+                }
             configured_events = list(item.get("corporate_events", []) or [])
             auto_events = [
                 _normalized_dividend_event(event)
@@ -331,8 +340,17 @@ class PortfolioStore:
                     for event in item.get("corporate_events", [])
                 ]
             merged.append(item)
-        # User-added watchlist items are not present in YAML and are fully owned by SQLite.
-        merged.extend(dynamic[symbol] for symbol in sorted(dynamic))
+        # User-added items are fully owned by SQLite, but keep the same
+        # internal override representation out of the strategy payload.
+        for symbol in sorted(dynamic):
+            item = copy.deepcopy(dynamic[symbol])
+            sizing_overrides = item.pop("sizing_overrides", None)
+            if isinstance(sizing_overrides, dict):
+                item["sizing"] = {
+                    **dict(item.get("sizing") or {}),
+                    **sizing_overrides,
+                }
+            merged.append(item)
         portfolio["positions"] = merged
         return result
 
@@ -377,6 +395,42 @@ class PortfolioStore:
                     now,
                 ),
             )
+
+    def set_position_weight_limits(
+        self,
+        *,
+        symbol: str,
+        target_main_weight: float,
+        max_single_position_weight: float,
+        portfolio_max_weight: float,
+    ) -> None:
+        """Persist one holding's soft target and hard concentration ceiling."""
+        symbol = _normalize_symbol(symbol)
+        target = _finite_float(target_main_weight, "长期目标仓位")
+        single_cap = _finite_float(max_single_position_weight, "单股仓位上限")
+        portfolio_cap = _finite_float(portfolio_max_weight, "账户级单股上限")
+        if not 0 < target <= 1:
+            raise PortfolioStoreError("长期目标仓位必须在0%到100%之间")
+        if not 0 < single_cap <= 1:
+            raise PortfolioStoreError("单股仓位上限必须在0%到100%之间")
+        if not 0 < portfolio_cap <= 1:
+            raise PortfolioStoreError("账户级单股上限配置无效")
+        if target > single_cap:
+            raise PortfolioStoreError("长期目标仓位不得高于单股仓位上限")
+        if single_cap > portfolio_cap:
+            raise PortfolioStoreError(
+                f"单股仓位上限不得超过账户级上限{portfolio_cap * 100:g}%"
+            )
+        now = _now()
+        with self._transaction() as conn:
+            record = self._position(conn, symbol)
+            if record.get("role") != "holding":
+                raise PortfolioStoreError("只有正式持仓可以设置仓位目标与上限")
+            sizing_overrides = dict(record.get("sizing_overrides") or {})
+            sizing_overrides["target_main_weight"] = round(target, 8)
+            sizing_overrides["max_single_position_weight"] = round(single_cap, 8)
+            record["sizing_overrides"] = sizing_overrides
+            self._save_position(conn, record, now)
 
     def transactions(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._connect() as conn:
