@@ -6,7 +6,7 @@ import unittest
 from zoneinfo import ZoneInfo
 
 from astock_bot.config import AppConfig
-from astock_bot.models import Position, SatellitePosition
+from astock_bot.models import Position, Quote, SatellitePosition
 from astock_bot.service import MonitorService
 
 
@@ -159,6 +159,34 @@ class DailySummaryTests(unittest.TestCase):
             self.assertEqual(row["informational_count"], 1)
             self.assertEqual(row["recommendation"], "临界机会观察，暂不建仓")
             self.assertIn("风险预算", row["reason"])
+
+    def test_summary_refreshes_display_quotes_at_send_time(self):
+        with TemporaryDirectory() as directory:
+            service = MonitorService(self._config(Path(directory)))
+            rows = [{
+                "symbol": "600362.SH",
+                "name": "江西铜业",
+                "price": 47.16,
+                "change_pct": 5.72,
+                "recommendation": "继续观察",
+                "reason": "测试",
+            }]
+            warnings: list[str] = []
+
+            class StubSource:
+                def quote(self, symbol: str) -> Quote:
+                    self.assertEqual(symbol, "600362.SH")
+                    return Quote(
+                        symbol, "江西铜业",
+                        datetime(2026, 8, 17, 15, 0, tzinfo=TZ),
+                        47.72, 44.61, 45.0, 48.0, 44.5, 1.0, 1.0,
+                    )
+
+            service.source = StubSource()
+            service._refresh_summary_quotes(rows, warnings)
+            self.assertEqual(rows[0]["price"], 47.72)
+            self.assertAlmostEqual(rows[0]["change_pct"], 6.97, places=2)
+            self.assertEqual(warnings, [])
 
     @staticmethod
     def _record(timestamp, node, execution_type=None):

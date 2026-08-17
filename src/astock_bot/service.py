@@ -692,6 +692,8 @@ class MonitorService:
         records = self._formal_records_for_day(now)
         rows = self._daily_summary_rows(records)
         nodes = list(self.config.schedule)
+        summary_warnings: list[str] = []
+        self._refresh_summary_quotes(rows, summary_warnings)
         present_nodes = {str(record.get("node")) for record in records}
         missing_nodes = [node for node in nodes if node not in present_nodes]
         warnings = [
@@ -701,6 +703,7 @@ class MonitorService:
             if warning
         ]
         warnings.extend(dividend_warnings)
+        warnings.extend(summary_warnings)
         if missing_nodes:
             warnings.append("缺少正式节点：" + "、".join(missing_nodes))
         title = str(self.config.section("notification").get("title", "A股持仓纪律"))
@@ -898,6 +901,24 @@ class MonitorService:
                 },
             })
         return rows
+
+    def _refresh_summary_quotes(self, rows: list[dict], warnings: list[str]) -> None:
+        """Refresh display price/change for the end-of-day summary.
+
+        Audit rows come from the last formal node (typically 14:15). At 15:30
+        we still want closing price and daily change, without re-running signals.
+        """
+        for row in rows:
+            symbol = str(row.get("symbol") or "")
+            if not symbol:
+                continue
+            try:
+                quote = self.source.quote(symbol)
+            except Exception as exc:
+                warnings.append(f"{symbol} 总结行情刷新失败: {exc}")
+                continue
+            row["price"] = quote.price
+            row["change_pct"] = quote.change_ratio * 100
 
     @staticmethod
     def _summary_recommendation(summary: dict, role: str) -> str:
