@@ -381,6 +381,45 @@ class PortfolioStoreTests(unittest.TestCase):
             self.assertEqual(item["analysis_profile"]["coverage"], "full")
             self.assertEqual(item["peers"], ["600498.SH", "601869.SH"])
 
+    def test_copper_derivative_profile_and_exposure_are_persisted_and_backfilled(self):
+        with TemporaryDirectory() as directory:
+            store = PortfolioStore(Path(directory) / "portfolio.db")
+            raw = {"portfolio": portfolio()}
+            store.ensure_seed(raw["portfolio"])
+            legacy = store.snapshot(raw)["positions"][0]
+            self.assertEqual(
+                legacy["analysis_profile"]["related_derivatives"][0]["product"],
+                "CU",
+            )
+            self.assertEqual(
+                legacy["commodity_exposures"][0]["exposure_types"],
+                ["integrated_or_unknown"],
+            )
+
+            store.add_watchlist(
+                symbol="000630.SZ",
+                name="铜陵有色",
+                sector="copper",
+                analysis_profile={
+                    "coverage": "full",
+                    "related_derivatives": [{
+                        "kind": "commodity_option", "exchange": "SHFE",
+                        "product": "CU", "label": "沪铜期权", "role": "auxiliary",
+                    }],
+                },
+                commodity_exposures=[{
+                    "commodity": "copper", "exchange": "SHFE",
+                    "exposure_types": ["smelting"], "hedge_disclosed": True,
+                }],
+            )
+            item = next(
+                position for position in store.snapshot(raw)["positions"]
+                if position["symbol"] == "000630.SZ"
+            )
+            self.assertEqual(item["commodity_exposures"][0]["exposure_types"], ["smelting"])
+            self.assertTrue(item["commodity_exposures"][0]["hedge_disclosed"])
+            self.assertEqual(item["analysis_profile"]["related_derivatives"][0]["role"], "auxiliary")
+
     def test_basic_tracking_cannot_be_confirmed_as_a_main_position(self):
         with TemporaryDirectory() as directory:
             store = PortfolioStore(Path(directory) / "portfolio.db")

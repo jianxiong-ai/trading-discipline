@@ -68,6 +68,10 @@ class Position:
     # 本轮完整交易周期的风险本金。它与 economic_basis（累计净经济投入）
     # 分离：卖出、分红会改变后者，但不得把已发生风险从硬上限分母中抹掉。
     risk_principal: float | None = None
+    # Deterministic company-to-commodity exposure map created during onboarding.
+    # It is research context only: derivative observations may confirm or warn,
+    # but never replace the underlying industry gate or create an order by itself.
+    commodity_exposures: tuple[dict[str, Any], ...] = field(default_factory=tuple)
 
     @property
     def total_shares(self) -> int:
@@ -86,6 +90,29 @@ class EvidenceItem:
     summary: str
     freshness: str = "fresh"
     fact_type: str = "sourced_fact"
+
+
+@dataclass(frozen=True)
+class OptionContractSnapshot:
+    instrument_id: str
+    underlying_id: str
+    option_type: str
+    strike: float
+    settlement: float
+    previous_settlement: float
+    volume: float
+    open_interest: float
+    open_interest_change: float
+    delta: float | None = None
+
+
+@dataclass(frozen=True)
+class CommodityOptionEvidence:
+    status: str = "not_applicable"
+    view: str = "unavailable"
+    summary: str = "商品期权不适用"
+    metrics: dict[str, Any] = field(default_factory=dict)
+    item: EvidenceItem | None = None
 
 
 @dataclass(frozen=True)
@@ -118,6 +145,10 @@ class EquityEvidence:
     shareholder_signal: str = "missing"
     shareholder_change_ratio: float | None = None
     shareholder_summary: str = "股东户数辅助数据不可用"
+    commodity_option_status: str = "not_applicable"
+    commodity_option_view: str = "unavailable"
+    commodity_option_summary: str = "商品期权不适用"
+    commodity_option_metrics: dict[str, Any] = field(default_factory=dict)
 
     @property
     def corporate_action_confirmation(self) -> bool:
@@ -185,6 +216,45 @@ class EquityEvidence:
         ) or (
             self.company_direction is not None and self.company_direction < 0
         ) or self.announcement_risk in {"caution", "critical"}
+
+    @property
+    def commodity_option_confirmation(self) -> bool:
+        """One auxiliary confirmation, only after the matching industry gate is positive."""
+        view = str(
+            (self.commodity_option_metrics or {}).get("industry_linked_view")
+            or self.commodity_option_view
+        )
+        status = str(
+            (self.commodity_option_metrics or {}).get("industry_linked_status")
+            or self.commodity_option_status
+        )
+        return (
+            status == "fresh"
+            and view == "upside_demand"
+            and self.industry_status == "fresh"
+            and self.industry_direction is not None
+            and self.industry_direction > 0
+            and not self.commodity_option_divergence
+        )
+
+    @property
+    def commodity_option_divergence(self) -> bool:
+        """Industry-linked option chain shows hedging while the industry gate is positive."""
+        view = str(
+            (self.commodity_option_metrics or {}).get("industry_linked_view")
+            or self.commodity_option_view
+        )
+        status = str(
+            (self.commodity_option_metrics or {}).get("industry_linked_status")
+            or self.commodity_option_status
+        )
+        return (
+            status == "fresh"
+            and view == "downside_hedging"
+            and self.industry_status == "fresh"
+            and self.industry_direction is not None
+            and self.industry_direction > 0
+        )
 
 
 @dataclass

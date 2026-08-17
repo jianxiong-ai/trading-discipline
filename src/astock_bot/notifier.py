@@ -90,6 +90,19 @@ def render_message(
                 )
             if evidence_lines:
                 lines.extend(["", "【证据】", *evidence_lines])
+        option_status = str(
+            signal.details.get("commodity_option_status") or "not_applicable"
+        )
+        option_summary = str(
+            signal.details.get("commodity_option_summary") or ""
+        ).strip()
+        if option_status not in {"not_applicable", "disabled"} and option_summary:
+            lines.extend([
+                "",
+                "【商品期权辅助】",
+                _clip(option_summary, 220),
+                "说明：仅作外部确认或风险提示，不替代期货门控，不单独触发本次动作。",
+            ])
         if signal.code in {"OVERHEAT_WATCH", "WATCH_NEAR_ENTRY"}:
             lines.extend(["", "级别：提醒（非买卖指令）"])
         references = []
@@ -137,6 +150,10 @@ def render_daily_summary(
         lines.append(f"{row['name']}（{row['symbol']}） {price_text}（{change_text}）")
         lines.append(f"建议：{row['recommendation']}")
         lines.append(f"原因：{row['reason']}")
+        option_status = str(row.get("commodity_option_status") or "not_applicable")
+        option_summary = str(row.get("commodity_option_summary") or "").strip()
+        if option_status not in {"not_applicable", "disabled"} and option_summary:
+            lines.append("期权辅助：" + _clip(option_summary, 200))
         status_by_node = row.get("status_by_node", {})
         lines.append("节点：" + "｜".join(f"{node} {status_by_node.get(node, '缺失')}" for node in nodes))
     if warnings:

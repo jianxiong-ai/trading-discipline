@@ -145,6 +145,9 @@ class DailySummaryTests(unittest.TestCase):
             record["summaries"][0].update({
                 "role": "watchlist", "support": 39.8, "resistance": 42.0,
                 "stage": {"label": "BOTTOM_CONFIRMED"},
+                "commodity_option_status": "fresh",
+                "commodity_option_view": "balanced",
+                "commodity_option_summary": "沪铜期权近ATM双边结构均衡。",
             })
             record["signals"] = [{
                 "symbol": "600362.SH",
@@ -159,6 +162,9 @@ class DailySummaryTests(unittest.TestCase):
             self.assertEqual(row["informational_count"], 1)
             self.assertEqual(row["recommendation"], "临界机会观察，暂不建仓")
             self.assertIn("风险预算", row["reason"])
+            self.assertEqual(row["commodity_option_status"], "fresh")
+            self.assertEqual(row["commodity_option_view"], "balanced")
+            self.assertIn("近ATM", row["commodity_option_summary"])
 
     def test_summary_refreshes_display_quotes_at_send_time(self):
         with TemporaryDirectory() as directory:
@@ -172,10 +178,11 @@ class DailySummaryTests(unittest.TestCase):
                 "reason": "测试",
             }]
             warnings: list[str] = []
+            case = self
 
             class StubSource:
                 def quote(self, symbol: str) -> Quote:
-                    self.assertEqual(symbol, "600362.SH")
+                    case.assertEqual(symbol, "600362.SH")
                     return Quote(
                         symbol, "江西铜业",
                         datetime(2026, 8, 17, 15, 0, tzinfo=TZ),

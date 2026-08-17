@@ -342,6 +342,7 @@ class MonitorService:
                     "role": position.role,
                     "status": "DATA_MISSING",
                     "evidence": equity_evidence.summary if equity_evidence else "证据不可用",
+                    **self._commodity_option_fields(equity_evidence),
                 })
                 continue
             try:
@@ -392,6 +393,7 @@ class MonitorService:
                             if equity_evidence else "正向公司行动证据不可用"
                         ),
                         "evidence_items": self._evidence_items(equity_evidence),
+                        **self._commodity_option_fields(equity_evidence),
                     })
                     continue
                 if any(item.startswith(f"{position.symbol} 行情延迟") for item in warnings):
@@ -401,6 +403,7 @@ class MonitorService:
                         "status": "STALE",
                         "price": quote.price,
                         "change_pct": quote.change_ratio * 100,
+                        **self._commodity_option_fields(equity_evidence),
                     })
                     continue
                 tech = compute_technicals(daily[position.symbol], intraday[position.symbol], quote.price, quote.timestamp)
@@ -513,6 +516,7 @@ class MonitorService:
                 )
                 for signal in found:
                     signal.details["change_pct"] = quote.change_ratio * 100
+                    signal.details.update(self._commodity_option_fields(equity_evidence))
                 signals.extend(found)
                 summaries.append({
                     "symbol": position.symbol,
@@ -602,6 +606,7 @@ class MonitorService:
                         if equity_evidence else "股东户数辅助数据不可用"
                     ),
                     "evidence_items": self._evidence_items(equity_evidence),
+                    **self._commodity_option_fields(equity_evidence),
                 })
             except Exception as exc:
                 warnings.append(f"{position.symbol} analysis: {exc}")
@@ -611,6 +616,7 @@ class MonitorService:
                     "status": "DATA_MISSING",
                     "price": quote.price,
                     "change_pct": quote.change_ratio * 100,
+                    **self._commodity_option_fields(equity_evidence),
                 })
 
         selected, selection_suppressed = self._rank_capital_entries(signals)
@@ -895,6 +901,15 @@ class MonitorService:
                 "latest_node": latest_node,
                 "stage": latest.get("stage", {}),
                 "role": position.role,
+                "commodity_option_status": latest.get(
+                    "commodity_option_status", "not_applicable"
+                ),
+                "commodity_option_view": latest.get(
+                    "commodity_option_view", "unavailable"
+                ),
+                "commodity_option_summary": latest.get(
+                    "commodity_option_summary", "商品期权不适用"
+                ),
                 "status_by_node": {
                     node: status_text.get(str(per_node[node].get("status")), str(per_node[node].get("status")))
                     for node in self.config.schedule if node in per_node
@@ -1670,6 +1685,22 @@ class MonitorService:
             }
             for item in evidence.items
         ]
+
+    @staticmethod
+    def _commodity_option_fields(evidence) -> dict:
+        if not evidence:
+            return {
+                "commodity_option_status": "not_applicable",
+                "commodity_option_view": "unavailable",
+                "commodity_option_summary": "商品期权不适用",
+                "commodity_option_metrics": {},
+            }
+        return {
+            "commodity_option_status": evidence.commodity_option_status,
+            "commodity_option_view": evidence.commodity_option_view,
+            "commodity_option_summary": evidence.commodity_option_summary,
+            "commodity_option_metrics": evidence.commodity_option_metrics,
+        }
 
     @staticmethod
     def _result(

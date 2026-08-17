@@ -41,6 +41,100 @@ class StockOnboardingTests(unittest.TestCase):
         self.assertEqual(result.sector, "generic")
         self.assertEqual(result.analysis_profile["coverage"], "basic")
         self.assertIn("不触发首次建仓", result.analysis_profile["signal_policy"])
+        self.assertEqual(result.commodity_exposures, [])
+
+    def test_copper_onboarding_maps_company_exposure_and_option_auxiliary(self):
+        service = StockOnboardingService(
+            profile_fetcher=lambda symbol: profile(
+                name="江西铜业",
+                full_name="江西铜业股份有限公司",
+                industry="铜矿采选与铜冶炼",
+                business="铜矿山、阴极铜冶炼、铜杆加工，并开展套期保值",
+                description="覆盖资源、冶炼和加工环节",
+            )
+        )
+        result = service.onboard("600362.SH")
+        self.assertEqual(result.sector, "copper")
+        self.assertEqual(result.commodity_exposures[0]["option_product"], "cu_o")
+        self.assertEqual(
+            result.commodity_exposures[0]["exposure_types"],
+            ["mining", "smelting", "processing"],
+        )
+        self.assertTrue(result.commodity_exposures[0]["hedge_disclosed"])
+        self.assertEqual(
+            result.analysis_profile["related_derivatives"][0]["role"], "auxiliary"
+        )
+        self.assertIn("沪铜期权辅助", result.analysis_profile["evidence_route"])
+
+    def test_gold_miner_maps_gold_sector_and_option(self):
+        service = StockOnboardingService(
+            profile_fetcher=lambda symbol: profile(
+                name="山东黄金",
+                full_name="山东黄金矿业股份有限公司",
+                industry="黄金",
+                business="金矿采选、黄金冶炼",
+                description="",
+            )
+        )
+        result = service.onboard("600547.SH")
+        self.assertEqual(result.sector, "gold")
+        self.assertEqual(
+            [item["commodity"] for item in result.commodity_exposures],
+            ["gold"],
+        )
+        self.assertEqual(result.analysis_profile["related_derivatives"][0]["label"], "沪金期权")
+        self.assertIn("沪金期货", result.analysis_profile["evidence_route"])
+
+    def test_silver_miner_maps_silver_sector_and_option(self):
+        service = StockOnboardingService(
+            profile_fetcher=lambda symbol: profile(
+                name="盛达资源",
+                full_name="盛达金属资源股份有限公司",
+                industry="白银",
+                business="银矿采选、银冶炼",
+                description="",
+            )
+        )
+        result = service.onboard("000603.SZ")
+        self.assertEqual(result.sector, "silver")
+        self.assertEqual(
+            [item["commodity"] for item in result.commodity_exposures],
+            ["silver"],
+        )
+        self.assertEqual(result.analysis_profile["related_derivatives"][0]["label"], "沪银期权")
+
+    def test_diversified_miner_maps_copper_and_gold_options(self):
+        service = StockOnboardingService(
+            profile_fetcher=lambda symbol: profile(
+                name="紫金矿业",
+                full_name="紫金矿业集团股份有限公司",
+                industry="有色金属",
+                business="铜矿采选;铜冶炼;金矿采选;金冶炼",
+                description="紫金山大型金铜矿",
+            )
+        )
+        result = service.onboard("601899.SH")
+        self.assertEqual(result.sector, "copper")
+        self.assertEqual(
+            [item["commodity"] for item in result.commodity_exposures],
+            ["copper", "gold"],
+        )
+        labels = [item["label"] for item in result.analysis_profile["related_derivatives"]]
+        self.assertEqual(labels, ["沪铜期权", "沪金期权"])
+
+    def test_molybdenum_miner_still_gets_copper_option_auxiliary(self):
+        service = StockOnboardingService(
+            profile_fetcher=lambda symbol: profile(
+                name="洛阳钼业",
+                industry="小金属",
+                business="钨钼系列产品",
+                description="是全球领先的铜、钴、钼、钨、铌生产商",
+            )
+        )
+        result = service.onboard("603993.SH")
+        self.assertEqual(result.sector, "generic")
+        self.assertEqual(result.commodity_exposures[0]["commodity"], "copper")
+        self.assertEqual(result.analysis_profile["related_derivatives"][0]["label"], "沪铜期权")
 
     @patch.dict(os.environ, {"LLM_API_KEY": "test-key"})
     def test_optional_llm_can_review_but_only_with_allowed_sector(self):

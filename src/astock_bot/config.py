@@ -12,6 +12,7 @@ import yaml
 
 from .models import Position, SatellitePosition
 from .market_calendar import resolve_holidays
+from .commodity_defaults import default_legacy_copper_exposure
 from .portfolio_store import PortfolioStore
 from .workspace import WorkspaceRegistry
 
@@ -77,6 +78,13 @@ def load_config(path: str | Path, workspace_id: str | None = None) -> AppConfig:
         raw = store.overlay(raw)
     positions: list[Position] = []
     for item in raw.get("portfolio", {}).get("positions", []):
+        commodity_exposures = [
+            dict(exposure)
+            for exposure in item.get("commodity_exposures", [])
+            if isinstance(exposure, dict)
+        ]
+        if str(item.get("sector", "generic")) == "copper" and not commodity_exposures:
+            commodity_exposures = [default_legacy_copper_exposure()]
         satellite_raw = item.get("satellite", {})
         entry_date = satellite_raw.get("entry_date")
         if isinstance(entry_date, str) and entry_date:
@@ -132,6 +140,7 @@ def load_config(path: str | Path, workspace_id: str | None = None) -> AppConfig:
                     ),
                 )
             ),
+            commodity_exposures=tuple(commodity_exposures),
         )
         _validate_position(position)
         positions.append(position)
@@ -488,6 +497,8 @@ def _validate_config(raw: dict[str, Any], positions: list[Position]) -> None:
         raise ValueError("启用主仓加仓时必须启用 evidence 产业与公告证据")
     supported_sectors = {
         "copper",
+        "gold",
+        "silver",
         "insurance",
         "insurance_financial_group",
         "new_energy_vehicle",
@@ -502,16 +513,58 @@ def _validate_config(raw: dict[str, Any], positions: list[Position]) -> None:
     if bool(evidence.get("enabled", False)) and unknown_sectors:
         raise ValueError(f"以下行业缺少证据路由: {sorted(unknown_sectors)}")
     copper = evidence.get("copper", {})
-    if float(copper.get("negative_change_ratio", -0.003)) >= float(
-        copper.get("positive_change_ratio", 0.003)
-    ):
-        raise ValueError("evidence.copper 涨跌阈值顺序无效")
-    if float(copper.get("negative_trend_ratio", -0.006)) >= float(
-        copper.get("positive_trend_ratio", 0.006)
-    ):
-        raise ValueError("evidence.copper 趋势阈值顺序无效")
+    for key in ("copper", "gold", "silver"):
+        settings = evidence.get(key) or {}
+        if key != "copper" and not settings:
+            continue
+        if float(settings.get("negative_change_ratio", -0.003)) >= float(
+            settings.get("positive_change_ratio", 0.003)
+        ):
+            raise ValueError(f"evidence.{key} 涨跌阈值顺序无效")
+        if float(settings.get("negative_trend_ratio", -0.006)) >= float(
+            settings.get("positive_trend_ratio", 0.006)
+        ):
+            raise ValueError(f"evidence.{key} 趋势阈值顺序无效")
     if float(copper.get("warrant_change_ratio", 0.03)) <= 0:
         raise ValueError("evidence.copper.warrant_change_ratio 必须大于0")
+    commodity_options = evidence.get("commodity_options", {})
+    if bool(commodity_options.get("enabled", False)):
+        min_days = int(commodity_options.get("min_days_to_expiry", 7))
+        max_days = int(commodity_options.get("max_days_to_expiry", 90))
+        if not 0 < min_days < max_days <= 365:
+            raise ValueError("evidence.commodity_options 到期期限范围无效")
+        max_moneyness = float(commodity_options.get("max_moneyness_ratio", 0.12))
+        if not 0 < max_moneyness <= 0.5:
+            raise ValueError("evidence.commodity_options.max_moneyness_ratio 必须在(0, 0.5]之间")
+        if int(commodity_options.get("min_volume", 5)) < 0:
+            raise ValueError("evidence.commodity_options.min_volume 不得小于0")
+        if int(commodity_options.get("min_open_interest", 50)) < 0:
+            raise ValueError("evidence.commodity_options.min_open_interest 不得小于0")
+        if int(commodity_options.get("minimum_paired_strikes", 3)) < 1:
+            raise ValueError("evidence.commodity_options.minimum_paired_strikes 必须至少为1")
+        if int(commodity_options.get("max_age_calendar_days", 4)) < 1:
+            raise ValueError("evidence.commodity_options.max_age_calendar_days 必须至少为1")
+        rate = float(commodity_options.get("risk_free_rate", 0.015))
+        if not -0.05 <= rate <= 0.20:
+            raise ValueError("evidence.commodity_options.risk_free_rate 超出合理范围")
+        if float(commodity_options.get("volatility_expansion_threshold", 0.03)) <= 0:
+            raise ValueError(
+                "evidence.commodity_options.volatility_expansion_threshold 必须大于0"
+            )
+        pcr_low = float(commodity_options.get("put_call_low", 0.70))
+        pcr_high = float(commodity_options.get("put_call_high", 1.30))
+        if not 0 < pcr_low < pcr_high:
+            raise ValueError("evidence.commodity_options Put/Call 阈值顺序无效")
+        routes = commodity_options.get("routes") or {}
+        for key, route in routes.items():
+            if not isinstance(route, dict):
+                raise ValueError(f"evidence.commodity_options.routes.{key} 必须是对象")
+            if str(route.get("exchange") or "SHFE").upper() != "SHFE":
+                raise ValueError(f"evidence.commodity_options.routes.{key}.exchange 当前仅支持 SHFE")
+            if not str(route.get("futures_product") or "").strip():
+                raise ValueError(
+                    f"evidence.commodity_options.routes.{key}.futures_product 不能为空"
+                )
     announcements = evidence.get("announcements", {})
     if int(announcements.get("max_operating_documents", 2)) < 0:
         raise ValueError("evidence.announcements.max_operating_documents 不得小于0")

@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import ast
+import calendar
 import gzip
 import json
 import hashlib
 from io import BytesIO
+import math
 import re
 import time
 from datetime import date, datetime, timedelta
 from html import unescape
 from pathlib import Path
+from statistics import NormalDist
 from typing import Any
 from urllib.parse import urlencode, urljoin
 from urllib.request import Request, urlopen
@@ -20,7 +23,13 @@ try:
 except ImportError:  # Unit tests may run before optional Docker dependencies are installed.
     PdfReader = None
 
-from .models import EquityEvidence, EvidenceItem, Position
+from .models import (
+    CommodityOptionEvidence,
+    EquityEvidence,
+    EvidenceItem,
+    OptionContractSnapshot,
+    Position,
+)
 
 
 SSE_ANNOUNCEMENT_URL = "https://query.sse.com.cn/security/stock/queryCompanyBulletin.do"
@@ -37,6 +46,10 @@ EASTMONEY_FFLOW_URLS = (
 EASTMONEY_FFLOW_UT = "fa5fd1943c7b386f172d6893dbfba10b"
 EASTMONEY_HOLDER_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 SHFE_DAILY_URL = "https://www.shfe.com.cn/data/tradedata/future/dailydata/kx{date}.dat"
+SHFE_OPTION_DAILY_URL = "https://www.shfe.com.cn/data/tradedata/option/dailydata/kx{date}.dat"
+SHFE_OPTION_CONTRACT_URL = (
+    "https://www.shfe.com.cn/data/busiparamdata/option/ContractBaseInfo{date}.dat"
+)
 SHFE_WARRANT_URLS = (
     "https://www.shfe.com.cn/data/tradedata/future/dailydata/{date}dailystock.dat",
     "https://www.shfe.com.cn/data/dailydata/{year}/{date}dailystock.dat",
@@ -97,6 +110,223 @@ CORPORATE_ACTION_STAGE_LABELS = {
     "completed": "实施完成",
     "terminated": "终止/未实施",
 }
+
+DEFAULT_COMMODITY_OPTION_ROUTES: dict[str, dict[str, Any]] = {
+    "copper": {
+        "commodity": "copper",
+        "industry_sector": "copper",
+        "exchange": "SHFE",
+        "futures_product": "cu",
+        "option_product": "cu_o",
+        "label": "沪铜",
+    },
+    "gold": {
+        "commodity": "gold",
+        "industry_sector": "gold",
+        "exchange": "SHFE",
+        "futures_product": "au",
+        "option_product": "au_o",
+        "label": "沪金",
+    },
+    "silver": {
+        "commodity": "silver",
+        "industry_sector": "silver",
+        "exchange": "SHFE",
+        "futures_product": "ag",
+        "option_product": "ag_o",
+        "label": "沪银",
+    },
+}
+
+
+def commodity_option_routes(settings: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    if not bool(settings.get("enabled", False)):
+        return {}
+    configured = settings.get("routes") or {}
+    routes: dict[str, dict[str, Any]] = {}
+    for key, default in DEFAULT_COMMODITY_OPTION_ROUTES.items():
+        merged = {**default, **(configured.get(key) or {})}
+        if merged.get("exchange") == "SHFE" and merged.get("futures_product"):
+            merged["commodity"] = str(merged.get("commodity") or key)
+            routes[key] = merged
+    for key, route in configured.items():
+        if key in routes or not isinstance(route, dict):
+            continue
+        merged = {**route}
+        if merged.get("exchange") == "SHFE" and merged.get("futures_product"):
+            merged["commodity"] = str(merged.get("commodity") or key)
+            routes[key] = merged
+    return routes
+
+
+def position_commodity_keys(position) -> set[str]:
+    keys = {
+        str(exposure.get("commodity"))
+        for exposure in getattr(position, "commodity_exposures", ())
+        if isinstance(exposure, dict) and exposure.get("commodity")
+    }
+    if position.sector in DEFAULT_COMMODITY_OPTION_ROUTES:
+        keys.add(position.sector)
+    return keys
+
+
+def resolve_commodity_option_routes(
+    position,
+    routes: dict[str, dict[str, Any]],
+    *,
+    enabled: bool,
+) -> tuple[list[tuple[str, dict[str, Any]]], str | None]:
+    """Return matching (route_key, route) pairs and an optional disabled reason."""
+    wanted = position_commodity_keys(position)
+    matched = [
+        (key, route)
+        for key, route in routes.items()
+        if key in wanted
+        or str(route.get("commodity") or "") in wanted
+        or route.get("industry_sector") == position.sector
+        or route.get("sector") == position.sector
+    ]
+    if not matched and not wanted:
+        return [], None
+    if not matched:
+        return [], None
+    if not enabled:
+        return [], "disabled"
+    return matched, None
+
+
+def resolve_commodity_option_route(
+    position,
+    routes: dict[str, dict[str, Any]],
+    *,
+    enabled: bool,
+) -> tuple[str | None, dict[str, Any] | None, str | None]:
+    matched, reason = resolve_commodity_option_routes(position, routes, enabled=enabled)
+    if not matched:
+        return None, None, reason
+    key, route = matched[0]
+    return key, route, reason
+
+
+def commodity_exposure_option_note(
+    exposures: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    commodity: str | None = None,
+) -> str:
+    if not exposures:
+        return ""
+    selected = next(
+        (
+            exposure for exposure in exposures
+            if commodity and str(exposure.get("commodity") or "") == commodity
+        ),
+        exposures[0],
+    )
+    types = [str(value) for value in selected.get("exposure_types") or []]
+    sensitivity = str(selected.get("sensitivity") or "").strip()
+    if selected.get("hedge_disclosed"):
+        hedge_note = "公司资料提及套保，期权信号需结合实际对冲头寸解读"
+        return "；".join(part for part in (sensitivity, hedge_note) if part)
+    return sensitivity
+
+
+def finalize_commodity_option_summary(
+    context: "CommodityOptionEvidence",
+    exposures: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    industry_direction: int | None,
+    *,
+    commodity: str | None = None,
+    industry_linked: bool = False,
+) -> str:
+    parts = [context.summary]
+    exposure_note = commodity_exposure_option_note(exposures, commodity)
+    if exposure_note and exposure_note not in context.summary:
+        parts.append(exposure_note)
+    if (
+        industry_linked
+        and context.status == "fresh"
+        and context.view == "downside_hedging"
+        and industry_direction is not None
+        and industry_direction > 0
+    ):
+        parts.append("期货证据与期权保护需求背离，不作新增辅助确认")
+    elif context.status == "fresh" and not industry_linked:
+        parts.append("该期权链未与当前行业门控对齐，只作观察、不加分也不单独交易")
+    return "；".join(part for part in parts if part)
+
+
+def merge_commodity_option_contexts(
+    matched: list[tuple[str, dict[str, Any], "CommodityOptionEvidence"]],
+    exposures: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    industry_direction: int | None,
+    position_sector: str,
+) -> tuple["CommodityOptionEvidence", list["EvidenceItem"]]:
+    if not matched:
+        empty = CommodityOptionEvidence()
+        return empty, []
+    summaries: list[str] = []
+    items: list[EvidenceItem] = []
+    by_commodity: dict[str, Any] = {}
+    statuses: list[str] = []
+    industry_linked_view = "unavailable"
+    industry_linked_status = "not_applicable"
+    display_view = "unavailable"
+    for key, route, context in matched:
+        commodity = str(route.get("commodity") or key)
+        industry_linked = route.get("industry_sector") == position_sector or (
+            position_sector == commodity
+        )
+        summary = finalize_commodity_option_summary(
+            context,
+            exposures,
+            industry_direction,
+            commodity=commodity,
+            industry_linked=industry_linked,
+        )
+        by_commodity[commodity] = {
+            "status": context.status,
+            "view": context.view,
+            "summary": summary,
+            "industry_linked": industry_linked,
+            **dict(context.metrics or {}),
+        }
+        statuses.append(context.status)
+        summaries.append(summary)
+        if industry_linked:
+            industry_linked_view = context.view
+            industry_linked_status = context.status
+            display_view = context.view
+        elif display_view == "unavailable" and context.view != "unavailable":
+            display_view = context.view
+        if context.item is not None:
+            items.append(EvidenceItem(
+                key=context.item.key,
+                label=context.item.label,
+                source=context.item.source,
+                source_url=context.item.source_url,
+                observed_at=context.item.observed_at,
+                direction=0,
+                strength=0,
+                summary=summary,
+                freshness=context.item.freshness,
+                fact_type=context.item.fact_type,
+            ))
+    status = "fresh" if "fresh" in statuses else (
+        "partial" if "partial" in statuses else (
+            "missing" if "missing" in statuses else statuses[0]
+        )
+    )
+    merged = CommodityOptionEvidence(
+        status=status,
+        view=display_view,
+        summary=" ｜ ".join(summaries),
+        metrics={
+            "by_commodity": by_commodity,
+            "industry_linked_view": industry_linked_view,
+            "industry_linked_status": industry_linked_status,
+        },
+        item=items[0] if items else None,
+    )
+    return merged, items
 
 
 class EvidenceSourceError(RuntimeError):
@@ -169,6 +399,46 @@ class OfficialEvidenceCollector:
             else:
                 industry_statuses[sector] = "missing"
 
+        option_contexts: dict[str, CommodityOptionEvidence] = {}
+        option_settings = self.config.get("commodity_options", {})
+        option_routes = commodity_option_routes(option_settings)
+        option_enabled = bool(option_settings.get("enabled", False))
+        needed_keys: set[str] = set()
+        for position in positions:
+            wanted = position_commodity_keys(position)
+            for key, route in option_routes.items():
+                if (
+                    key in wanted
+                    or str(route.get("commodity") or "") in wanted
+                    or route.get("industry_sector") == position.sector
+                    or route.get("sector") == position.sector
+                ):
+                    needed_keys.add(key)
+        for route_key, route in option_routes.items():
+            if route_key not in needed_keys:
+                continue
+            cache_day = as_of.astimezone(self.tz).date().isoformat()
+            cached_option = self._read_commodity_option_cache(cache_day, route_key)
+            if cached_option is not None:
+                option_contexts[route_key] = cached_option
+                continue
+            try:
+                if str(route.get("exchange")).upper() == "SHFE":
+                    option_contexts[route_key] = self._load_shfe_option_chain(route, as_of)
+                else:
+                    raise EvidenceSourceError(f"未支持的期权交易所: {route.get('exchange')}")
+                self._write_commodity_option_cache(
+                    cache_day, route_key, option_contexts[route_key]
+                )
+            except Exception as exc:
+                label = str(route.get("label") or route_key)
+                warnings.append(f"{route.get('commodity', route_key)} {label}期权辅助: {exc}")
+                option_contexts[route_key] = CommodityOptionEvidence(
+                    status="missing",
+                    view="unavailable",
+                    summary=f"{label}期权辅助数据不可用；不影响对应期货产业门控",
+                )
+
         result: dict[str, EquityEvidence] = {}
         for position in positions:
             announcement_items: list[EvidenceItem] = []
@@ -231,6 +501,45 @@ class OfficialEvidenceCollector:
                 ),
                 default=0,
             )
+            matched_routes, disabled_reason = resolve_commodity_option_routes(
+                position, option_routes, enabled=option_enabled
+            )
+            if matched_routes:
+                option_context, option_items = merge_commodity_option_contexts(
+                    [
+                        (
+                            key,
+                            route,
+                            option_contexts.get(
+                                key,
+                                CommodityOptionEvidence(
+                                    status="missing",
+                                    view="unavailable",
+                                    summary=f"{route.get('label', key)}期权辅助数据不可用",
+                                ),
+                            ),
+                        )
+                        for key, route in matched_routes
+                    ],
+                    position.commodity_exposures,
+                    industry_direction,
+                    position.sector,
+                )
+            elif disabled_reason == "disabled":
+                option_context = CommodityOptionEvidence(
+                    status="disabled",
+                    view="unavailable",
+                    summary="商品期权辅助已关闭",
+                )
+                option_items = []
+            else:
+                option_context = CommodityOptionEvidence(
+                    status="not_applicable",
+                    view="unavailable",
+                    summary="商品期权不适用",
+                )
+                option_items = []
+            option_summary = option_context.summary
             company_items = [
                 item for item in announcement_items
                 if item.fact_type == "company_operating_metric"
@@ -293,6 +602,7 @@ class OfficialEvidenceCollector:
                 + ([margin_item] if margin_item else [])
                 + ([capital_item] if capital_item else [])
                 + ([holder_item] if holder_item else [])
+                + option_items
             )
             result[position.symbol] = EquityEvidence(
                 symbol=position.symbol,
@@ -331,6 +641,10 @@ class OfficialEvidenceCollector:
                 shareholder_summary=(
                     holder_item.summary if holder_item else "股东户数辅助数据不可用"
                 ),
+                commodity_option_status=option_context.status,
+                commodity_option_view=option_context.view,
+                commodity_option_summary=option_summary,
+                commodity_option_metrics=option_context.metrics,
             )
         return result, warnings
 
@@ -401,11 +715,89 @@ class OfficialEvidenceCollector:
         except (OSError, ValueError, TypeError):
             return
 
+    def _read_commodity_option_cache(
+        self, day: str, sector: str
+    ) -> CommodityOptionEvidence | None:
+        path = self._cache_path(day)
+        if path is None or not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            raw = payload.get("commodity_options", {}).get(sector)
+            if not isinstance(raw, dict):
+                return None
+            item_raw = raw.get("item")
+            item = None
+            if isinstance(item_raw, dict):
+                item = EvidenceItem(
+                    key=str(item_raw["key"]),
+                    label=str(item_raw["label"]),
+                    source=str(item_raw["source"]),
+                    source_url=str(item_raw["source_url"]),
+                    observed_at=datetime.fromisoformat(str(item_raw["observed_at"])),
+                    direction=0,
+                    strength=0,
+                    summary=str(item_raw["summary"]),
+                    freshness=str(item_raw.get("freshness", raw.get("status", "fresh"))),
+                    fact_type="commodity_option_context",
+                )
+            return CommodityOptionEvidence(
+                status=str(raw["status"]),
+                view=str(raw["view"]),
+                summary=str(raw["summary"]),
+                metrics=dict(raw.get("metrics") or {}),
+                item=item,
+            )
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    def _write_commodity_option_cache(
+        self, day: str, sector: str, evidence: CommodityOptionEvidence
+    ) -> None:
+        path = self._cache_path(day)
+        if path is None:
+            return
+        try:
+            payload: dict[str, Any] = {}
+            if path.exists():
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            bucket = payload.setdefault("commodity_options", {})
+            item = evidence.item
+            bucket[sector] = {
+                "status": evidence.status,
+                "view": evidence.view,
+                "summary": evidence.summary,
+                "metrics": evidence.metrics,
+                "item": ({
+                    "key": item.key,
+                    "label": item.label,
+                    "source": item.source,
+                    "source_url": item.source_url,
+                    "observed_at": item.observed_at.isoformat(),
+                    "summary": item.summary,
+                    "freshness": item.freshness,
+                } if item else None),
+            }
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        except (OSError, ValueError, TypeError):
+            return
+
     def _industry_sources(self, sector: str, as_of: datetime):
         # 每项为 (label, loader, required)。可选源失败时不拖累 industry_status=fresh。
-        if sector == "copper":
-            sources = [("沪铜行情", lambda: self._shfe_copper(as_of), True)]
-            if bool(self.config.get("copper", {}).get("warrant_enabled", True)):
+        if sector in DEFAULT_COMMODITY_OPTION_ROUTES:
+            route = DEFAULT_COMMODITY_OPTION_ROUTES[sector]
+            product = str(route["futures_product"])
+            label = str(route["label"])
+            sources = [(
+                f"{label}行情",
+                lambda product=product, label=label, sector=sector: self._shfe_futures_trend(
+                    as_of, product, sector, label
+                ),
+                True,
+            )]
+            if sector == "copper" and bool(self.config.get("copper", {}).get("warrant_enabled", True)):
                 sources.append(("沪铜仓单", lambda: self._shfe_copper_warrant(as_of), False))
             return sources
         if sector in {"insurance", "insurance_financial_group"}:
@@ -611,9 +1003,19 @@ class OfficialEvidenceCollector:
         return article_date, title, source_url, _html_text(article_html)
 
     def _shfe_copper(self, as_of: datetime) -> EvidenceItem:
-        settings = self.config.get("copper", {})
+        return self._shfe_futures_trend(as_of, "cu", "copper", "沪铜")
+
+    def _shfe_futures_trend(
+        self,
+        as_of: datetime,
+        product: str,
+        sector_key: str,
+        label: str,
+    ) -> EvidenceItem:
+        settings = self.config.get(sector_key) or self.config.get("copper") or {}
         max_age = int(settings.get("max_age_calendar_days", 4))
         trend_sessions = int(settings.get("trend_lookback_sessions", 3))
+        product_id = product.lower()
         observations: list[tuple[date, dict[str, Any], str]] = []
         # 日行情通常在收盘后发布；盘中只使用最近已完成交易日。
         for offset in range(1, max_age + trend_sessions + 8):
@@ -629,20 +1031,20 @@ class OfficialEvidenceCollector:
             except Exception:
                 continue
         if not observations:
-            raise EvidenceSourceError("未取得最近上期所沪铜日行情")
+            raise EvidenceSourceError(f"未取得最近上期所{label}日行情")
         source_date, payload, source_url = observations[0]
         candidates = [
             row for row in payload.get("o_curinstrument", [])
-            if str(row.get("PRODUCTGROUPID", "")).lower() == "cu"
+            if str(row.get("PRODUCTGROUPID", "")).lower() == product_id
             and str(row.get("DELIVERYMONTH", "")).isdigit()
         ]
         if not candidates:
-            raise EvidenceSourceError("上期所日行情缺少沪铜合约")
+            raise EvidenceSourceError(f"上期所日行情缺少{label}合约")
         main = max(candidates, key=lambda row: float(row.get("OPENINTEREST") or 0))
         previous = float(main.get("PRESETTLEMENTPRICE") or 0)
         change = float(main.get("ZD1_CHG") or 0)
         if previous <= 0:
-            raise EvidenceSourceError("沪铜前结算价无效")
+            raise EvidenceSourceError(f"{label}前结算价无效")
         change_ratio = change / previous
         positive = float(settings.get("positive_change_ratio", 0.003))
         negative = float(settings.get("negative_change_ratio", -0.003))
@@ -654,7 +1056,7 @@ class OfficialEvidenceCollector:
             matching = next(
                 (
                     row for row in observed_payload.get("o_curinstrument", [])
-                    if str(row.get("PRODUCTGROUPID", "")).lower() == "cu"
+                    if str(row.get("PRODUCTGROUPID", "")).lower() == product_id
                     and str(row.get("DELIVERYMONTH")) == delivery_month
                 ),
                 None,
@@ -676,11 +1078,11 @@ class OfficialEvidenceCollector:
         direction = -1 if negative_signal else (1 if positive_signal else 0)
         age = (as_of.date() - source_date).days
         freshness = "fresh" if age <= max_age else "stale"
-        contract = f"CU{delivery_month}"
+        contract = f"{product.upper()}{delivery_month}"
         trend_text = f"、{len(settlements)}日{trend_ratio:+.2%}" if trend_ratio is not None else "、趋势样本不足"
         return EvidenceItem(
-            key=f"shfe-copper-{source_date.isoformat()}-{contract}",
-            label="上期所沪铜主力日行情",
+            key=f"shfe-{sector_key}-{source_date.isoformat()}-{contract}",
+            label=f"上期所{label}主力日行情",
             source="上海期货交易所",
             source_url=source_url,
             observed_at=datetime.combine(source_date, datetime.min.time(), self.tz).replace(hour=15),
@@ -777,6 +1179,65 @@ class OfficialEvidenceCollector:
             strength=1 if direction else 0,
             summary=f"上期所铜仓单{latest:.0f}吨、较前次{change_ratio:+.2%}（{latest_date.isoformat()}日终）",
             freshness="fresh" if age <= max_age else "stale",
+        )
+
+    def _load_shfe_option_chain(
+        self, route: dict[str, Any], as_of: datetime
+    ) -> CommodityOptionEvidence:
+        """Build an end-of-day option-chain context that is separate from industry direction."""
+        settings = self.config.get("commodity_options", {})
+        futures_product = str(route.get("futures_product") or "cu").lower()
+        commodity_label = str(route.get("label") or futures_product.upper())
+        max_age = int(settings.get("max_age_calendar_days", 4))
+        latest: tuple[date, dict[str, Any], dict[str, Any], dict[str, Any], str] | None = None
+        last_error: Exception | None = None
+        for offset in range(1, max_age + 12):
+            candidate = as_of.date() - timedelta(days=offset)
+            if candidate.weekday() >= 5:
+                continue
+            date_text = candidate.strftime("%Y%m%d")
+            option_url = SHFE_OPTION_DAILY_URL.format(date=date_text)
+            try:
+                option_payload = self._get_json(option_url, "https://www.shfe.com.cn/")
+                future_payload = self._get_json(
+                    SHFE_DAILY_URL.format(date=date_text), "https://www.shfe.com.cn/"
+                )
+                try:
+                    contract_payload = self._get_json(
+                        SHFE_OPTION_CONTRACT_URL.format(date=date_text),
+                        "https://www.shfe.com.cn/",
+                    )
+                except Exception:
+                    contract_payload = {}
+                if parse_shfe_option_contracts(option_payload, futures_product):
+                    latest = (
+                        candidate,
+                        option_payload,
+                        future_payload,
+                        contract_payload,
+                        option_url,
+                    )
+                    break
+            except Exception as exc:
+                last_error = exc
+        if latest is None:
+            raise EvidenceSourceError(
+                f"未取得最近上期所{commodity_label}期权日行情"
+                f"{': ' + str(last_error) if last_error else ''}"
+            )
+        source_date, option_payload, future_payload, contract_payload, source_url = latest
+        if source_date > as_of.date():
+            raise EvidenceSourceError(f"{commodity_label}期权行情日期晚于分析时点")
+        return analyze_shfe_option_chain(
+            option_payload=option_payload,
+            future_payload=future_payload,
+            contract_payload=contract_payload,
+            source_date=source_date,
+            as_of=as_of,
+            settings=settings,
+            source_url=source_url,
+            futures_product=futures_product,
+            commodity_label=commodity_label,
         )
 
     def _announcements(self, symbol: str, as_of: datetime) -> list[EvidenceItem]:
@@ -1967,6 +2428,507 @@ def parse_shfe_copper_warrant(payload: dict[str, Any]) -> float | None:
         return max(totals)
     values = [value for _, value in candidates]
     return sum(values) if values else None
+
+
+def parse_shfe_option_contracts(
+    payload: dict[str, Any], product_group: str = "cu"
+) -> list[OptionContractSnapshot]:
+    result: list[OptionContractSnapshot] = []
+    for row in payload.get("o_curinstrument", []) or []:
+        product = str(row.get("PRODUCTGROUPID") or "").strip().lower()
+        product_id = str(row.get("PRODUCTID") or "").strip().lower()
+        if product != product_group.lower() and product_id != f"{product_group.lower()}_o":
+            continue
+        instrument_id = str(row.get("INSTRUMENTID") or "").strip()
+        underlying_id = str(row.get("UNDERLYINGINSTRID") or "").strip().lower()
+        raw_type = str(row.get("OPTIONSTYPE") or "").strip().upper()
+        option_type = "call" if raw_type in {"1", "C", "CALL"} else (
+            "put" if raw_type in {"2", "P", "PUT"} else ""
+        )
+        if not option_type:
+            compact = instrument_id.replace("-", "")
+            match = re.search(r"[CP]", compact.upper())
+            if match:
+                option_type = "call" if match.group(0) == "C" else "put"
+        strike = _coerce_number(row.get("STRIKEPRICE"))
+        settlement = _coerce_number(row.get("SETTLEMENTPRICE"))
+        previous = _coerce_number(row.get("PRESETTLEMENTPRICE"))
+        if (
+            not instrument_id
+            or not underlying_id
+            or not option_type
+            or strike is None
+            or settlement is None
+            or previous is None
+            or strike <= 0
+            or settlement <= 0
+            or previous <= 0
+        ):
+            continue
+        delta = _coerce_number(row.get("DELTA"))
+        result.append(OptionContractSnapshot(
+            instrument_id=instrument_id,
+            underlying_id=underlying_id,
+            option_type=option_type,
+            strike=strike,
+            settlement=settlement,
+            previous_settlement=previous,
+            volume=max(_coerce_number(row.get("VOLUME")) or 0.0, 0.0),
+            open_interest=max(_coerce_number(row.get("OPENINTEREST")) or 0.0, 0.0),
+            open_interest_change=_coerce_number(row.get("OPENINTERESTCHG")) or 0.0,
+            delta=delta,
+        ))
+    return result
+
+
+def parse_shfe_option_expiries(payload: dict[str, Any]) -> dict[str, date]:
+    expiries: dict[str, date] = {}
+    for row in payload.get("OptionContractBaseInfo", []) or []:
+        instrument_id = str(row.get("INSTRUMENTID") or "").strip()
+        raw_expiry = str(row.get("EXPIREDATE") or "").strip()
+        if not instrument_id or not re.fullmatch(r"\d{8}", raw_expiry):
+            continue
+        try:
+            expiries[instrument_id] = datetime.strptime(raw_expiry, "%Y%m%d").date()
+        except ValueError:
+            continue
+    return expiries
+
+
+def analyze_shfe_option_chain(
+    *,
+    option_payload: dict[str, Any],
+    future_payload: dict[str, Any],
+    contract_payload: dict[str, Any],
+    source_date: date,
+    as_of: datetime,
+    settings: dict[str, Any],
+    source_url: str = "",
+    futures_product: str = "cu",
+    commodity_label: str = "沪铜",
+) -> CommodityOptionEvidence:
+    product = futures_product.lower()
+    contracts = parse_shfe_option_contracts(option_payload, product)
+    if not contracts:
+        raise EvidenceSourceError(f"上期所期权日行情缺少有效{commodity_label}合约")
+    expiries = parse_shfe_option_expiries(contract_payload)
+    futures = _shfe_future_settlements(future_payload, product)
+    if not futures:
+        raise EvidenceSourceError(f"上期所日行情缺少{commodity_label}标的期货结算价")
+
+    min_days = int(settings.get("min_days_to_expiry", 7))
+    max_days = int(settings.get("max_days_to_expiry", 90))
+    max_moneyness = float(settings.get("max_moneyness_ratio", 0.12))
+    min_volume = float(settings.get("min_volume", 5))
+    min_open_interest = float(settings.get("min_open_interest", 50))
+    minimum_pairs = int(settings.get("minimum_paired_strikes", 3))
+    rate = float(settings.get("risk_free_rate", 0.015))
+
+    grouped: dict[str, list[OptionContractSnapshot]] = {}
+    for contract in contracts:
+        grouped.setdefault(contract.underlying_id, []).append(contract)
+    candidates: list[dict[str, Any]] = []
+    partial_counts: list[tuple[str, int]] = []
+    for underlying_id, rows in grouped.items():
+        future = futures.get(underlying_id)
+        if not future:
+            continue
+        expiry_values = [expiries.get(row.instrument_id) for row in rows]
+        expiry = next((value for value in expiry_values if value is not None), None)
+        if expiry is None:
+            expiry = _fallback_shfe_option_expiry(underlying_id, product)
+        if expiry is None:
+            continue
+        days_to_expiry = (expiry - source_date).days
+        if days_to_expiry < min_days or days_to_expiry > max_days:
+            continue
+        future_settlement, previous_future = future
+        liquid = [
+            row for row in rows
+            if abs(row.strike / future_settlement - 1) <= max_moneyness
+            and row.volume >= min_volume
+            and row.open_interest >= min_open_interest
+        ]
+        by_strike: dict[float, dict[str, OptionContractSnapshot]] = {}
+        for row in liquid:
+            by_strike.setdefault(row.strike, {})[row.option_type] = row
+        pairs = [
+            (strike, pair["call"], pair["put"])
+            for strike, pair in by_strike.items()
+            if "call" in pair and "put" in pair
+        ]
+        partial_counts.append((underlying_id, len(pairs)))
+        if len(pairs) < minimum_pairs:
+            continue
+        candidates.append({
+            "underlying_id": underlying_id,
+            "future": future_settlement,
+            "previous_future": previous_future,
+            "expiry": expiry,
+            "days_to_expiry": days_to_expiry,
+            "pairs": sorted(pairs),
+            "liquid": liquid,
+        })
+
+    if not candidates:
+        best_underlying, best_count = max(partial_counts, key=lambda value: value[1], default=("CU", 0))
+        summary = (
+            f"{commodity_label}期权链不完整：{best_underlying.upper()}仅{best_count}组近月近ATM双边合约满足流动性；"
+            f"仅作数据提示，不影响{commodity_label}期货产业门控"
+        )
+        return CommodityOptionEvidence(
+            status="partial",
+            view="unavailable",
+            summary=summary,
+            metrics={"underlying": best_underlying.upper(), "paired_strikes": best_count},
+            item=EvidenceItem(
+                key=f"shfe-{product}-options-{source_date.isoformat()}-partial",
+                label=f"上期所{commodity_label}期权链辅助",
+                source="上海期货交易所",
+                source_url=source_url,
+                observed_at=datetime.combine(source_date, datetime.min.time(), as_of.tzinfo).replace(hour=16),
+                direction=0,
+                strength=0,
+                summary=summary,
+                freshness="fresh",
+                fact_type="commodity_option_context",
+            ),
+        )
+
+    candidates.sort(key=lambda value: (value["days_to_expiry"], value["underlying_id"]))
+    selected = candidates[0]
+    maturity_metrics = _option_maturity_metrics(selected, source_date, rate)
+    next_metrics = (
+        _option_maturity_metrics(candidates[1], source_date, rate)
+        if len(candidates) > 1 else {}
+    )
+    term_structure = None
+    if maturity_metrics.get("atm_iv") is not None and next_metrics.get("atm_iv") is not None:
+        term_structure = float(next_metrics["atm_iv"]) - float(maturity_metrics["atm_iv"])
+    metrics = {
+        **maturity_metrics,
+        "source_date": source_date.isoformat(),
+        "underlying": str(selected["underlying_id"]).upper(),
+        "expiry": selected["expiry"].isoformat(),
+        "days_to_expiry": selected["days_to_expiry"],
+        "paired_strikes": len(selected["pairs"]),
+        "term_structure": term_structure,
+        "next_underlying": (
+            str(candidates[1]["underlying_id"]).upper() if len(candidates) > 1 else None
+        ),
+        "iv_method": "Black-76 proxy",
+        "raw_premium_is_underlying_return": False,
+    }
+    view = _commodity_option_view(metrics, settings)
+    metrics["view"] = view
+    age = (as_of.date() - source_date).days
+    max_age = int(settings.get("max_age_calendar_days", 4))
+    status = "fresh" if 0 <= age <= max_age else "stale"
+    summary = _commodity_option_summary(metrics, view, commodity_label)
+    item = EvidenceItem(
+        key=f"shfe-{product}-options-{source_date.isoformat()}-{selected['underlying_id']}",
+        label=f"上期所{commodity_label}期权链辅助",
+        source="上海期货交易所",
+        source_url=source_url,
+        observed_at=datetime.combine(source_date, datetime.min.time(), as_of.tzinfo).replace(hour=16),
+        direction=0,
+        strength=0,
+        summary=summary,
+        freshness=status,
+        fact_type="commodity_option_context",
+    )
+    return CommodityOptionEvidence(
+        status=status,
+        view=view,
+        summary=summary,
+        metrics=metrics,
+        item=item,
+    )
+
+
+def _shfe_future_settlements(
+    payload: dict[str, Any], product_group: str
+) -> dict[str, tuple[float, float]]:
+    result: dict[str, tuple[float, float]] = {}
+    for row in payload.get("o_curinstrument", []) or []:
+        if str(row.get("PRODUCTGROUPID") or "").lower() != product_group.lower():
+            continue
+        month = str(row.get("DELIVERYMONTH") or "").strip()
+        settlement = _coerce_number(row.get("SETTLEMENTPRICE"))
+        previous = _coerce_number(row.get("PRESETTLEMENTPRICE"))
+        if month.isdigit() and settlement and previous and settlement > 0 and previous > 0:
+            result[f"{product_group.lower()}{month}"] = (settlement, previous)
+    return result
+
+
+def _fallback_shfe_option_expiry(underlying_id: str, product_group: str = "cu") -> date | None:
+    prefix = product_group.lower()
+    match = re.fullmatch(rf"{re.escape(prefix)}(\d{{2}})(\d{{2}})", underlying_id.lower())
+    if not match:
+        return None
+    year = 2000 + int(match.group(1))
+    month = int(match.group(2)) - 1
+    if month == 0:
+        year -= 1
+        month = 12
+    day = calendar.monthrange(year, month)[1]
+    candidate = date(year, month, day)
+    remaining = 5
+    while remaining:
+        if candidate.weekday() < 5:
+            remaining -= 1
+            if remaining == 0:
+                return candidate
+        candidate -= timedelta(days=1)
+    return None
+
+
+def _option_maturity_metrics(
+    candidate: dict[str, Any], source_date: date, rate: float
+) -> dict[str, Any]:
+    future = float(candidate["future"])
+    previous_future = float(candidate["previous_future"])
+    expiry = candidate["expiry"]
+    time_to_expiry = max((expiry - source_date).days, 1) / 365.0
+    previous_time = time_to_expiry + 1 / 365.0
+    pairs = candidate["pairs"]
+    atm_strike, atm_call, atm_put = min(pairs, key=lambda row: abs(row[0] - future))
+    call_iv = _black76_implied_vol(
+        atm_call.settlement, future, atm_strike, time_to_expiry, rate, "call"
+    )
+    put_iv = _black76_implied_vol(
+        atm_put.settlement, future, atm_strike, time_to_expiry, rate, "put"
+    )
+    previous_call_iv = _black76_implied_vol(
+        atm_call.previous_settlement,
+        previous_future,
+        atm_strike,
+        previous_time,
+        rate,
+        "call",
+    )
+    previous_put_iv = _black76_implied_vol(
+        atm_put.previous_settlement,
+        previous_future,
+        atm_strike,
+        previous_time,
+        rate,
+        "put",
+    )
+    atm_iv = _mean_available(call_iv, put_iv)
+    previous_atm_iv = _mean_available(previous_call_iv, previous_put_iv)
+    atm_iv_change = (
+        atm_iv - previous_atm_iv
+        if atm_iv is not None and previous_atm_iv is not None else None
+    )
+    liquid = candidate["liquid"]
+    calls = [row for row in liquid if row.option_type == "call"]
+    puts = [row for row in liquid if row.option_type == "put"]
+    call_volume = sum(row.volume for row in calls)
+    put_volume = sum(row.volume for row in puts)
+    call_oi = sum(row.open_interest for row in calls)
+    put_oi = sum(row.open_interest for row in puts)
+    call_oi_change = sum(row.open_interest_change for row in calls)
+    put_oi_change = sum(row.open_interest_change for row in puts)
+    call_premium_change = _weighted_option_change(calls)
+    put_premium_change = _weighted_option_change(puts)
+
+    call_25 = min(
+        (row for row in calls if row.delta is not None),
+        key=lambda row: abs(abs(float(row.delta)) - 0.25),
+        default=None,
+    )
+    put_25 = min(
+        (row for row in puts if row.delta is not None),
+        key=lambda row: abs(abs(float(row.delta)) - 0.25),
+        default=None,
+    )
+    call_25_iv = (
+        _black76_implied_vol(
+            call_25.settlement, future, call_25.strike, time_to_expiry, rate, "call"
+        ) if call_25 else None
+    )
+    put_25_iv = (
+        _black76_implied_vol(
+            put_25.settlement, future, put_25.strike, time_to_expiry, rate, "put"
+        ) if put_25 else None
+    )
+    skew_25d = (
+        put_25_iv - call_25_iv
+        if put_25_iv is not None and call_25_iv is not None else None
+    )
+    return {
+        "future_settlement": future,
+        "future_change": future / previous_future - 1,
+        "atm_strike": atm_strike,
+        "atm_iv": atm_iv,
+        "previous_atm_iv": previous_atm_iv,
+        "atm_iv_change": atm_iv_change,
+        "skew_25d": skew_25d,
+        "put_call_volume_ratio": put_volume / call_volume if call_volume > 0 else None,
+        "put_call_open_interest_ratio": put_oi / call_oi if call_oi > 0 else None,
+        "call_premium_change": call_premium_change,
+        "put_premium_change": put_premium_change,
+        "call_open_interest_change_ratio": (
+            call_oi_change / max(call_oi - call_oi_change, 1.0)
+        ),
+        "put_open_interest_change_ratio": (
+            put_oi_change / max(put_oi - put_oi_change, 1.0)
+        ),
+        "call_price_open_interest_sync": bool(
+            call_premium_change is not None
+            and call_premium_change > 0
+            and call_oi_change > 0
+        ),
+        "put_price_open_interest_sync": bool(
+            put_premium_change is not None
+            and put_premium_change > 0
+            and put_oi_change > 0
+        ),
+        "call_volume": call_volume,
+        "put_volume": put_volume,
+        "call_open_interest": call_oi,
+        "put_open_interest": put_oi,
+    }
+
+
+def _black76_implied_vol(
+    price: float,
+    future: float,
+    strike: float,
+    time_to_expiry: float,
+    rate: float,
+    option_type: str,
+) -> float | None:
+    if min(price, future, strike, time_to_expiry) <= 0:
+        return None
+    discount = math.exp(-rate * time_to_expiry)
+    intrinsic = discount * max(
+        future - strike if option_type == "call" else strike - future,
+        0.0,
+    )
+    upper = discount * (future if option_type == "call" else strike)
+    if price < intrinsic - 1e-8 or price >= upper:
+        return None
+    normal = NormalDist()
+
+    def model(volatility: float) -> float:
+        sigma_root = volatility * math.sqrt(time_to_expiry)
+        if sigma_root <= 0:
+            return intrinsic
+        d1 = (math.log(future / strike) + 0.5 * volatility * volatility * time_to_expiry) / sigma_root
+        d2 = d1 - sigma_root
+        if option_type == "call":
+            return discount * (future * normal.cdf(d1) - strike * normal.cdf(d2))
+        return discount * (strike * normal.cdf(-d2) - future * normal.cdf(-d1))
+
+    low, high = 0.0001, 5.0
+    if model(high) < price:
+        return None
+    for _ in range(80):
+        mid = (low + high) / 2
+        if model(mid) < price:
+            low = mid
+        else:
+            high = mid
+    return (low + high) / 2
+
+
+def _weighted_option_change(rows: list[OptionContractSnapshot]) -> float | None:
+    weighted = [
+        (row.settlement / row.previous_settlement - 1, max(row.open_interest, row.volume, 1.0))
+        for row in rows
+        if row.previous_settlement > 0
+    ]
+    total_weight = sum(weight for _, weight in weighted)
+    return (
+        sum(change * weight for change, weight in weighted) / total_weight
+        if total_weight > 0 else None
+    )
+
+
+def _mean_available(*values: float | None) -> float | None:
+    present = [float(value) for value in values if value is not None]
+    return sum(present) / len(present) if present else None
+
+
+def _commodity_option_view(metrics: dict[str, Any], settings: dict[str, Any]) -> str:
+    iv_change = metrics.get("atm_iv_change")
+    call_premium = metrics.get("call_premium_change")
+    put_premium = metrics.get("put_premium_change")
+    call_oi = metrics.get("call_open_interest_change_ratio")
+    put_oi = metrics.get("put_open_interest_change_ratio")
+    pcr_oi = metrics.get("put_call_open_interest_ratio")
+    skew = metrics.get("skew_25d")
+    future_change = metrics.get("future_change")
+    vol_threshold = float(settings.get("volatility_expansion_threshold", 0.03))
+    pcr_low = float(settings.get("put_call_low", 0.70))
+    pcr_high = float(settings.get("put_call_high", 1.30))
+    call_sync = bool(call_premium is not None and call_premium > 0.10 and call_oi > 0)
+    put_sync = bool(put_premium is not None and put_premium > 0.10 and put_oi > 0)
+    if iv_change is not None and iv_change >= vol_threshold and call_sync and put_sync:
+        return "volatility_expansion"
+    if (
+        future_change is not None and future_change > 0
+        and call_sync
+        and ((pcr_oi is not None and pcr_oi <= pcr_low) or (skew is not None and skew < 0))
+    ):
+        return "upside_demand"
+    if put_sync and (
+        (pcr_oi is not None and pcr_oi >= pcr_high) or (skew is not None and skew > 0)
+    ):
+        return "downside_hedging"
+    if call_sync or put_sync or (iv_change is not None and abs(iv_change) >= vol_threshold):
+        return "mixed"
+    return "balanced"
+
+
+def _commodity_option_summary(
+    metrics: dict[str, Any], view: str, commodity_label: str = "沪铜"
+) -> str:
+    labels = {
+        "balanced": "期权结构均衡",
+        "upside_demand": "认购需求与标的期货同向",
+        "downside_hedging": "认沽保护需求偏强",
+        "volatility_expansion": "双边波动率扩张",
+        "mixed": "期权结构信号混合",
+    }
+    iv = metrics.get("atm_iv")
+    iv_change = metrics.get("atm_iv_change")
+    skew = metrics.get("skew_25d")
+    pcr_volume = metrics.get("put_call_volume_ratio")
+    pcr_oi = metrics.get("put_call_open_interest_ratio")
+    parts = [
+        f"上期所{metrics.get('underlying', commodity_label.upper())}期权（{metrics.get('source_date', '日期暂缺')}日终）",
+        f"剩余{metrics.get('days_to_expiry', '?')}天",
+        f"近ATM双边{metrics.get('paired_strikes', 0)}组",
+    ]
+    if iv is not None:
+        change_text = f"、较前日{iv_change * 100:+.1f}波动率点" if iv_change is not None else ""
+        parts.append(f"ATM代理IV {iv:.1%}{change_text}")
+    if skew is not None:
+        parts.append(f"25Δ认沽-认购偏度{skew * 100:+.1f}波动率点")
+    if pcr_volume is not None or pcr_oi is not None:
+        volume_text = f"{pcr_volume:.2f}" if pcr_volume is not None else "—"
+        oi_text = f"{pcr_oi:.2f}" if pcr_oi is not None else "—"
+        parts.append(f"Put/Call成交量比{volume_text}、持仓量比{oi_text}")
+    term_structure = metrics.get("term_structure")
+    if term_structure is not None:
+        term_label = "远月隐波高于近月" if term_structure >= 0 else "近月隐波高于远月"
+        parts.append(f"期限结构：{term_label}{abs(term_structure) * 100:.1f}波动率点")
+    sync_labels = []
+    if metrics.get("call_price_open_interest_sync"):
+        sync_labels.append("认购价格-持仓同步增强")
+    if metrics.get("put_price_open_interest_sync"):
+        sync_labels.append("认沽价格-持仓同步增强")
+    if sync_labels:
+        parts.append("、".join(sync_labels))
+    parts.append(labels.get(view, "期权辅助不可判定"))
+    parts.append("权利金涨跌不等同商品期货或个股涨跌，仅作辅助观察")
+    return "；".join(parts)
+
+
+analyze_shfe_copper_option_chain = analyze_shfe_option_chain
 
 
 def parse_margin_observations(

@@ -9,6 +9,10 @@ from typing import Any, Callable
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from .commodity_defaults import (
+    detect_commodity_exposures,
+    related_derivatives_for_exposures,
+)
 from .portfolio_store import PortfolioStoreError, _normalize_symbol
 
 
@@ -20,11 +24,51 @@ DEFAULT_LLM_MODEL = "deepseek-v4-flash"
 SECTOR_CATALOG: dict[str, dict[str, Any]] = {
     "copper": {
         "label": "铜产业",
-        "route": "沪铜、铜仓单、同行与公司公告",
+        "route": "沪铜期货、铜仓单、沪铜期权辅助、同行与公司公告",
         "keywords": ("铜矿", "铜冶炼", "阴极铜", "铜加工", "铜业"),
         "peers": ("601899.SH", "000630.SZ", "000878.SZ"),
         "drivers": ("铜价与库存变化", "矿山与冶炼盈利", "产量及资本开支"),
         "risks": ("铜价下行", "冶炼费承压", "海外项目与汇率波动"),
+        "related_derivatives": ({
+            "kind": "commodity_option",
+            "exchange": "SHFE",
+            "product": "CU",
+            "underlying": "CU期货",
+            "label": "沪铜期权",
+            "role": "auxiliary",
+        },),
+    },
+    "gold": {
+        "label": "黄金",
+        "route": "沪金期货、沪金期权辅助、黄金同行与公司公告",
+        "keywords": ("黄金", "金矿采选", "黄金冶炼", "产金"),
+        "peers": ("600547.SH", "000975.SZ", "600988.SH"),
+        "drivers": ("金价与实际利率", "矿山产量与成本", "央行购金与避险需求"),
+        "risks": ("金价回落", "开采成本上升", "海外项目与汇率波动"),
+        "related_derivatives": ({
+            "kind": "commodity_option",
+            "exchange": "SHFE",
+            "product": "AU",
+            "underlying": "AU期货",
+            "label": "沪金期权",
+            "role": "auxiliary",
+        },),
+    },
+    "silver": {
+        "label": "白银",
+        "route": "沪银期货、沪银期权辅助、白银同行与公司公告",
+        "keywords": ("白银", "银矿", "银冶炼", "银精矿"),
+        "peers": ("000603.SZ", "002155.SZ"),
+        "drivers": ("银价与工业需求", "矿山产量", "金银比价"),
+        "risks": ("银价波动", "工业需求下滑", "副产品属性导致利润不稳定"),
+        "related_derivatives": ({
+            "kind": "commodity_option",
+            "exchange": "SHFE",
+            "product": "AG",
+            "underlying": "AG期货",
+            "label": "沪银期权",
+            "role": "auxiliary",
+        },),
     },
     "insurance": {
         "label": "寿险",
@@ -92,6 +136,7 @@ class OnboardingResult:
     sector: str
     peers: list[str]
     analysis_profile: dict[str, Any]
+    commodity_exposures: list[dict[str, Any]]
 
 
 class StockOnboardingService:
@@ -191,6 +236,7 @@ class StockOnboardingService:
 
         sector = str(classification["sector"])
         catalog = SECTOR_CATALOG[sector]
+        commodity_exposures = self._commodity_exposures(sector, source, classification)
         # Both exchanges now use official structured announcement queries. ETFs
         # remain not-applicable for company disclosures in the evidence layer.
         coverage = "full" if sector != "generic" else "basic"
@@ -205,6 +251,8 @@ class StockOnboardingService:
             "source_industry": str(source.get("industry", "")).strip(),
             "business_summary": str(classification.get("business_summary") or source.get("business") or source.get("description") or "")[:420],
             "evidence_route": catalog["route"],
+            "related_derivatives": related_derivatives_for_exposures(commodity_exposures),
+            "commodity_exposures": commodity_exposures,
             "drivers": _clean_lines(classification.get("drivers") or catalog["drivers"], 4),
             "risks": _clean_lines(classification.get("risks") or catalog["risks"], 4),
             "monitoring_topics": _clean_lines(classification.get("monitoring_topics") or catalog["drivers"], 5),
@@ -226,7 +274,31 @@ class StockOnboardingService:
             sector=sector,
             peers=list(classification.get("peers") or []),
             analysis_profile=analysis_profile,
+            commodity_exposures=commodity_exposures,
         )
+
+    @staticmethod
+    def _commodity_exposures(
+        sector: str,
+        source: dict[str, Any],
+        classification: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        classification = classification or {}
+        text = " ".join(
+            str(value)
+            for value in (
+                source.get("name"),
+                source.get("full_name"),
+                source.get("industry"),
+                source.get("business"),
+                source.get("description"),
+                classification.get("business_summary"),
+                " ".join(str(item) for item in classification.get("drivers") or []),
+                " ".join(str(item) for item in classification.get("monitoring_topics") or []),
+            )
+            if value
+        )
+        return detect_commodity_exposures(text, sector=sector)
 
     def _rule_classification(self, symbol: str, source: dict[str, Any]) -> dict[str, Any]:
         if symbol == "601318.SH":

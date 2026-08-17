@@ -44,7 +44,7 @@
     <div class="section-head"><div><p class="eyebrow">SUMMARY</p><h2>日内总结</h2></div></div>
     {% if latest_summary %}
       <p class="as-of">{{ latest_summary.timestamp[:16].replace('T', ' ') }}</p>
-      {% for row in latest_summary.review_rows[:4] %}<div class="brief"><strong>{{ row.name }} <small>{{ row.symbol }}{% if row.price is not none %} · {{ '{:.2f}'.format(row.price) }}{% endif %}{% if row.change_pct is not none %} · {{ '{:+.2f}%'.format(row.change_pct) }}{% endif %}</small></strong><span>{{ row.recommendation }}</span><p>{{ row.reason }}</p></div>{% endfor %}
+      {% for row in latest_summary.review_rows[:4] %}<div class="brief"><strong>{{ row.name }} <small>{{ row.symbol }}{% if row.price is not none %} · {{ '{:.2f}'.format(row.price) }}{% endif %}{% if row.change_pct is not none %} · {{ '{:+.2f}%'.format(row.change_pct) }}{% endif %}</small></strong><span>{{ row.recommendation }}</span><p>{{ row.reason }}</p>{% if row.commodity_option_status not in ['not_applicable', 'disabled'] %}<p>期权辅助：{{ row.commodity_option_summary }}</p>{% endif %}</div>{% endfor %}
     {% else %}<p class="empty">15:30 后生成当日总结。</p>{% endif %}
   </aside>
 </section>

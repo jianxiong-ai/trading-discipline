@@ -2709,6 +2709,10 @@ def _strong_confirmation_count(peer_change, market_change, evidence, rules) -> i
         # A verified corporate action is one confirmation at most. It never
         # replaces the technical/volume gates or the fresh industry gate.
         evidence is not None and evidence.corporate_action_confirmation,
+        # Commodity options are one auxiliary confirmation only when the
+        # underlying industry evidence is already fresh and positive. The
+        # option layer can never replace the futures gate or trigger alone.
+        evidence is not None and evidence.commodity_option_confirmation,
         # 股东户数下降（集中）可作为一项弱正向确认，不能替代产业门控。
         evidence is not None
         and evidence.shareholder_status == "fresh"
@@ -2748,6 +2752,8 @@ def _capital_flow_allows_entry(evidence: EquityEvidence | None) -> bool:
 
 
 def _auxiliary_allows_entry(evidence: EquityEvidence | None) -> bool:
+    if evidence is not None and evidence.commodity_option_divergence:
+        return False
     return _margin_allows_entry(evidence) and _capital_flow_allows_entry(evidence)
 
 

@@ -151,6 +151,41 @@ class NotifierTests(unittest.TestCase):
             text,
         )
 
+    def test_commodity_option_context_is_separate_and_non_actionable(self):
+        signal = Signal(
+            symbol="600362.SH", name="江西铜业", code="UP_BREAK", confidence="中",
+            price=47.0, key_level=46.0, action="分批增加主仓", shares=100,
+            reason="价格与沪铜期货共振", invalidation="跌回突破位",
+            event_id="option-context", category="strategy",
+            details={
+                "change_pct": 1.2,
+                "evidence": "沪铜期货方向与股价共振",
+                "commodity_option_status": "fresh",
+                "commodity_option_view": "volatility_expansion",
+                "commodity_option_summary": (
+                    "沪铜期权同到期近ATM双边隐波抬升；"
+                    "原始权利金涨跌不等同铜价或个股涨跌。"
+                ),
+            },
+        )
+        text = render_message([signal], "14:15", "A股持仓纪律")
+        self.assertIn("【商品期权辅助】", text)
+        self.assertIn("原始权利金涨跌不等同", text)
+        self.assertIn("不替代期货门控，不单独触发本次动作", text)
+        self.assertIn("证据：沪铜期货方向与股价共振", text)
+
+    def test_daily_summary_renders_option_context_without_counting_signal(self):
+        rows = [{
+            "symbol": "600362.SH", "name": "江西铜业", "price": 47.0,
+            "change_pct": 1.2, "recommendation": "继续观察", "reason": "未触发动作",
+            "trigger_count": 0, "status_by_node": {"14:15": "观察"},
+            "commodity_option_status": "partial",
+            "commodity_option_summary": "沪铜期权仅取得认购一侧，不生成方向结论。",
+        }]
+        text = render_daily_summary(rows, ["14:15"], "2026-08-17", "A股持仓纪律")
+        self.assertIn("今日无操作信号", text)
+        self.assertIn("期权辅助：沪铜期权仅取得认购一侧", text)
+
 
 if __name__ == "__main__":
     unittest.main()

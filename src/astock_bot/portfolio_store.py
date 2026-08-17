@@ -15,6 +15,11 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterator
 
+from .commodity_defaults import (
+    default_copper_related_derivatives,
+    default_legacy_copper_exposure,
+)
+
 
 _SYMBOL_RE = re.compile(r"\d{6}\.(?:SH|SZ)")
 _DYNAMIC_KEYS = {
@@ -29,6 +34,8 @@ _DYNAMIC_KEYS = {
 }
 _SUPPORTED_SECTORS = (
     "copper",
+    "gold",
+    "silver",
     "insurance",
     "insurance_financial_group",
     "new_energy_vehicle",
@@ -486,6 +493,7 @@ class PortfolioStore:
         sector: str,
         peers: str | list[str] = "",
         analysis_profile: dict[str, Any] | None = None,
+        commodity_exposures: list[dict[str, Any]] | None = None,
     ) -> None:
         symbol = _normalize_symbol(symbol)
         name = name.strip()
@@ -517,6 +525,11 @@ class PortfolioStore:
             "sizing": {},
             "migration": {},
             "analysis_profile": profile,
+            "commodity_exposures": [
+                dict(exposure)
+                for exposure in (commodity_exposures or [])
+                if isinstance(exposure, dict)
+            ],
         }
         now = _now()
         with self._transaction() as conn:
@@ -1349,7 +1362,21 @@ def _normalized_payload(item: dict[str, Any]) -> dict[str, Any]:
             "coverage": coverage,
             "coverage_label": "完整跟踪" if coverage == "full" else "待补齐公告/产业证据",
         }
+    exposures = [
+        dict(exposure)
+        for exposure in payload.get("commodity_exposures", [])
+        if isinstance(exposure, dict)
+    ]
+    if payload["sector"] == "copper" and not exposures:
+        exposures = [default_legacy_copper_exposure()]
+    if payload["sector"] == "copper":
+        if not profile.get("related_derivatives"):
+            profile["related_derivatives"] = default_copper_related_derivatives()
+        if not profile.get("commodity_exposures"):
+            profile["commodity_exposures"] = exposures
+        profile["evidence_route"] = "沪铜期货、铜仓单、沪铜期权辅助、同行与公司公告"
     payload["analysis_profile"] = profile
+    payload["commodity_exposures"] = exposures
     payload["peers"] = [str(peer).upper() for peer in payload.get("peers", [])]
     payload["satellite_limit"] = int(payload.get("satellite_limit", 100))
     payload["main_adjustment_shares"] = int(payload.get("main_adjustment_shares", 100))

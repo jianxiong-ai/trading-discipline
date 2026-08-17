@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -9,6 +10,8 @@ from astock_bot.evidence import (
     classify_corporate_action_title,
     classify_operating_text,
     classify_announcement_title,
+    commodity_exposure_option_note,
+    finalize_commodity_option_summary,
     parse_corporate_action_terms,
     parse_cash_dividend_implementation,
     parse_chinabond_curve,
@@ -19,8 +22,17 @@ from astock_bot.evidence import (
     parse_optical_communications_yoy,
     parse_semiconductor_yoy,
     parse_shfe_copper_warrant,
+    analyze_shfe_copper_option_chain,
+    parse_shfe_option_contracts,
 )
-from astock_bot.models import EvidenceItem, Position, SatellitePosition
+from astock_bot.models import (
+    CommodityOptionEvidence,
+    EquityEvidence,
+    EvidenceItem,
+    Position,
+    SatellitePosition,
+)
+from astock_bot.strategy import _auxiliary_allows_entry
 
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -428,6 +440,300 @@ class EvidenceTests(unittest.TestCase):
         self.assertIn("CU2609", item.summary)
         self.assertIn("+0.50%", item.summary)
         self.assertIn("3日", item.summary)
+
+    def test_shfe_gold_selects_highest_open_interest_contract(self):
+        collector = OfficialEvidenceCollector("Asia/Shanghai", {
+            "retries": 0,
+            "gold": {"positive_change_ratio": 0.003, "negative_change_ratio": -0.003},
+        })
+        def payload(url, _):
+            settlement = 100500 if "20260728" in url else (100000 if "20260727" in url else 99500)
+            return {"o_curinstrument": [
+                    {
+                        "PRODUCTGROUPID": "au", "DELIVERYMONTH": "2608", "OPENINTEREST": 100,
+                        "PRESETTLEMENTPRICE": 100000, "ZD1_CHG": -100, "SETTLEMENTPRICE": 100000,
+                    },
+                    {
+                        "PRODUCTGROUPID": "au", "DELIVERYMONTH": "2609", "OPENINTEREST": 200,
+                        "PRESETTLEMENTPRICE": 100000, "ZD1_CHG": 500, "SETTLEMENTPRICE": settlement,
+                    },
+                    {
+                        "PRODUCTGROUPID": "cu", "DELIVERYMONTH": "2609", "OPENINTEREST": 999,
+                        "PRESETTLEMENTPRICE": 100000, "ZD1_CHG": 500, "SETTLEMENTPRICE": settlement,
+                    },
+                ]}
+        collector._get_json = payload
+        item = collector._shfe_futures_trend(
+            datetime(2026, 7, 29, 10, 15, tzinfo=TZ), "au", "gold", "沪金"
+        )
+        self.assertEqual(item.direction, 1)
+        self.assertIn("AU2609", item.summary)
+        self.assertIn("沪金", item.label)
+
+    def test_gold_industry_sources_require_futures_not_warrants(self):
+        collector = OfficialEvidenceCollector("Asia/Shanghai", {"cache_enabled": False})
+        sources = collector._industry_sources("gold", datetime(2026, 7, 29, 10, 15, tzinfo=TZ))
+        self.assertEqual([item[0] for item in sources], ["沪金行情"])
+        self.assertTrue(sources[0][2])
+
+    def test_copper_option_chain_filters_far_otm_premium_spike(self):
+        option_rows = []
+        strikes = [90, 95, 100, 105, 110]
+        call_prices = [10.3, 5.9, 2.2, 0.85, 0.25]
+        put_prices = [0.25, 0.9, 2.1, 5.9, 10.3]
+        previous_calls = [9.5, 5.0, 1.8, 0.6, 0.2]
+        previous_puts = [0.3, 1.0, 2.8, 6.6, 11.2]
+        call_deltas = [0.9, 0.75, 0.5, 0.25, 0.1]
+        put_deltas = [-0.1, -0.25, -0.5, -0.75, -0.9]
+        for strike, call, put, previous_call, previous_put, call_delta, put_delta in zip(
+            strikes, call_prices, put_prices, previous_calls, previous_puts,
+            call_deltas, put_deltas,
+        ):
+            for option_type, price, previous, delta in (
+                ("1", call, previous_call, call_delta),
+                ("2", put, previous_put, put_delta),
+            ):
+                side = "C" if option_type == "1" else "P"
+                option_rows.append({
+                    "INSTRUMENTID": f"cu2609{side}{strike}",
+                    "UNDERLYINGINSTRID": "cu2609",
+                    "PRODUCTGROUPID": "cu",
+                    "PRODUCTID": "cu_o",
+                    "OPTIONSTYPE": option_type,
+                    "STRIKEPRICE": strike,
+                    "SETTLEMENTPRICE": price,
+                    "PRESETTLEMENTPRICE": previous,
+                    "VOLUME": 100,
+                    "OPENINTEREST": 500,
+                    "OPENINTERESTCHG": 0,
+                    "DELTA": delta,
+                })
+        # This is the screenshot-style trap: a deep OTM call rises many times,
+        # but it is outside the near-ATM chain and must not drive the view.
+        option_rows.append({
+            "INSTRUMENTID": "cu2609C130",
+            "UNDERLYINGINSTRID": "cu2609",
+            "PRODUCTGROUPID": "cu",
+            "PRODUCTID": "cu_o",
+            "OPTIONSTYPE": "1",
+            "STRIKEPRICE": 130,
+            "SETTLEMENTPRICE": 2.0,
+            "PRESETTLEMENTPRICE": 0.02,
+            "VOLUME": 10000,
+            "OPENINTEREST": 1000,
+            "OPENINTERESTCHG": 500,
+            "DELTA": 0.05,
+        })
+        option_payload = {"o_curinstrument": option_rows}
+        future_payload = {"o_curinstrument": [{
+            "PRODUCTGROUPID": "cu", "DELIVERYMONTH": "2609",
+            "SETTLEMENTPRICE": 100, "PRESETTLEMENTPRICE": 99,
+        }]}
+        contract_payload = {"OptionContractBaseInfo": [
+            {"INSTRUMENTID": row["INSTRUMENTID"], "EXPIREDATE": "20260825"}
+            for row in option_rows
+        ]}
+        evidence = analyze_shfe_copper_option_chain(
+            option_payload=option_payload,
+            future_payload=future_payload,
+            contract_payload=contract_payload,
+            source_date=date(2026, 8, 14),
+            as_of=datetime(2026, 8, 17, 10, 15, tzinfo=TZ),
+            settings={
+                "min_days_to_expiry": 7,
+                "max_days_to_expiry": 90,
+                "max_moneyness_ratio": 0.12,
+                "min_volume": 5,
+                "min_open_interest": 50,
+                "minimum_paired_strikes": 3,
+            },
+            source_url="https://www.shfe.com.cn/example",
+        )
+        self.assertEqual(evidence.status, "fresh")
+        self.assertEqual(evidence.metrics["atm_strike"], 100)
+        self.assertEqual(evidence.metrics["paired_strikes"], 5)
+        self.assertNotEqual(evidence.view, "upside_demand")
+        self.assertEqual(evidence.item.direction, 0)
+        self.assertEqual(evidence.item.strength, 0)
+        self.assertIn("权利金涨跌不等同", evidence.summary)
+        with TemporaryDirectory() as directory:
+            collector = OfficialEvidenceCollector("Asia/Shanghai", {
+                "cache_enabled": True, "cache_dir": directory,
+            })
+            collector._write_commodity_option_cache("2026-08-17", "copper", evidence)
+            cached = collector._read_commodity_option_cache("2026-08-17", "copper")
+            self.assertIsNotNone(cached)
+            self.assertEqual(cached.view, evidence.view)
+            self.assertEqual(cached.metrics["atm_strike"], 100)
+            self.assertEqual(cached.item.direction, 0)
+
+    def test_copper_option_chain_requires_paired_liquid_strikes(self):
+        rows = [{
+            "INSTRUMENTID": f"cu2609C{strike}",
+            "UNDERLYINGINSTRID": "cu2609",
+            "PRODUCTGROUPID": "cu",
+            "PRODUCTID": "cu_o",
+            "OPTIONSTYPE": "1",
+            "STRIKEPRICE": strike,
+            "SETTLEMENTPRICE": 2,
+            "PRESETTLEMENTPRICE": 1,
+            "VOLUME": 100,
+            "OPENINTEREST": 500,
+            "OPENINTERESTCHG": 10,
+            "DELTA": 0.5,
+        } for strike in (95, 100, 105)]
+        evidence = analyze_shfe_copper_option_chain(
+            option_payload={"o_curinstrument": rows},
+            future_payload={"o_curinstrument": [{
+                "PRODUCTGROUPID": "cu", "DELIVERYMONTH": "2609",
+                "SETTLEMENTPRICE": 100, "PRESETTLEMENTPRICE": 99,
+            }]},
+            contract_payload={"OptionContractBaseInfo": [
+                {"INSTRUMENTID": row["INSTRUMENTID"], "EXPIREDATE": "20260825"}
+                for row in rows
+            ]},
+            source_date=date(2026, 8, 14),
+            as_of=datetime(2026, 8, 17, 10, 15, tzinfo=TZ),
+            settings={"minimum_paired_strikes": 3},
+        )
+        self.assertEqual(evidence.status, "partial")
+        self.assertEqual(evidence.view, "unavailable")
+
+    def test_option_auxiliary_cannot_replace_industry_gate(self):
+        blocked = EquityEvidence(
+            symbol="600362.SH",
+            industry_status="fresh",
+            industry_direction=0,
+            announcement_status="fresh",
+            announcement_risk="none",
+            summary="测试",
+            commodity_option_status="fresh",
+            commodity_option_view="upside_demand",
+        )
+        self.assertFalse(blocked.add_ready)
+        self.assertFalse(blocked.commodity_option_confirmation)
+        allowed = EquityEvidence(
+            symbol="600362.SH",
+            industry_status="fresh",
+            industry_direction=1,
+            announcement_status="fresh",
+            announcement_risk="none",
+            summary="测试",
+            commodity_option_status="fresh",
+            commodity_option_view="upside_demand",
+        )
+        self.assertTrue(allowed.add_ready)
+        self.assertTrue(allowed.commodity_option_confirmation)
+
+    def test_gold_option_observation_does_not_confirm_without_industry_gate(self):
+        gold_only = EquityEvidence(
+            symbol="600547.SH",
+            industry_status="missing",
+            industry_direction=None,
+            announcement_status="fresh",
+            announcement_risk="none",
+            summary="测试",
+            commodity_option_status="fresh",
+            commodity_option_view="upside_demand",
+            commodity_option_metrics={
+                "industry_linked_view": "unavailable",
+                "industry_linked_status": "not_applicable",
+            },
+        )
+        self.assertFalse(gold_only.commodity_option_confirmation)
+        self.assertFalse(gold_only.commodity_option_divergence)
+
+    def test_gold_option_confirms_when_gold_industry_gate_is_positive(self):
+        gold = EquityEvidence(
+            symbol="600547.SH",
+            industry_status="fresh",
+            industry_direction=1,
+            announcement_status="fresh",
+            announcement_risk="none",
+            summary="测试",
+            commodity_option_status="fresh",
+            commodity_option_view="upside_demand",
+            commodity_option_metrics={
+                "industry_linked_view": "upside_demand",
+                "industry_linked_status": "fresh",
+            },
+        )
+        self.assertTrue(gold.commodity_option_confirmation)
+        self.assertFalse(gold.commodity_option_divergence)
+
+    def test_option_divergence_blocks_confirmation_and_auxiliary_gate(self):
+        diverged = EquityEvidence(
+            symbol="600362.SH",
+            industry_status="fresh",
+            industry_direction=1,
+            announcement_status="fresh",
+            announcement_risk="none",
+            summary="测试",
+            commodity_option_status="fresh",
+            commodity_option_view="downside_hedging",
+        )
+        self.assertTrue(diverged.commodity_option_divergence)
+        self.assertFalse(diverged.commodity_option_confirmation)
+        self.assertFalse(_auxiliary_allows_entry(diverged))
+
+    def test_finalize_option_summary_adds_exposure_and_divergence_notes(self):
+        context = CommodityOptionEvidence(
+            status="fresh",
+            view="downside_hedging",
+            summary="认沽保护需求偏强",
+        )
+        summary = finalize_commodity_option_summary(
+            context,
+            ({
+                "commodity": "copper",
+                "exposure_types": ["smelting"],
+                "sensitivity": "公司偏冶炼环节：期权多头需结合加工费，不宜等同铜价上涨",
+            },),
+            1,
+            commodity="copper",
+            industry_linked=True,
+        )
+        self.assertIn("加工费", summary)
+        self.assertIn("背离", summary)
+
+    def test_commodity_exposure_option_note_for_mining(self):
+        note = commodity_exposure_option_note(({
+            "commodity": "gold",
+            "exposure_types": ["mining"],
+            "sensitivity": "公司偏资源端：期权/期货多头更贴近黄金价格方向，但仍需核对产量与成本",
+        },), "gold")
+        self.assertIn("资源端", note)
+
+    def test_option_source_failure_does_not_degrade_copper_futures_gate(self):
+        collector = OfficialEvidenceCollector("Asia/Shanghai", {
+            "commodity_options": {"enabled": True},
+            "cache_enabled": False,
+        })
+        industry_item = EvidenceItem(
+            key="cu-future", label="沪铜", source="上海期货交易所", source_url="",
+            observed_at=datetime(2026, 8, 14, 16, tzinfo=TZ),
+            direction=1, strength=2, summary="沪铜期货趋势向上",
+        )
+        collector._industry_sources = lambda *_: [
+            ("沪铜行情", lambda: industry_item, True)
+        ]
+        collector._load_shfe_option_chain = lambda *_: (_ for _ in ()).throw(
+            OSError("option timeout")
+        )
+        position = Position(
+            symbol="159999.SZ", name="铜ETF", main_shares=0, economic_basis=0,
+            sector="copper", satellite_limit=0, main_adjustment_shares=100,
+            peers=(), satellite=SatellitePosition(), role="watchlist",
+        )
+        result, warnings = collector.collect(
+            (position,), datetime(2026, 8, 17, 10, 15, tzinfo=TZ)
+        )
+        evidence = result[position.symbol]
+        self.assertEqual(evidence.industry_status, "fresh")
+        self.assertEqual(evidence.industry_direction, 1)
+        self.assertTrue(evidence.add_ready)
+        self.assertEqual(evidence.commodity_option_status, "missing")
+        self.assertTrue(any("沪铜期权辅助" in warning for warning in warnings))
 
     def test_chinabond_source_builds_insurance_evidence_item(self):
         collector = OfficialEvidenceCollector("Asia/Shanghai", {

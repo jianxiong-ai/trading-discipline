@@ -7,7 +7,7 @@ from unittest.mock import patch
 from starlette.requests import Request
 
 from astock_bot.portfolio_store import PortfolioStore
-from astock_bot.web import _context, set_position_target_weight, templates
+from astock_bot.web import _context, _review_records, set_position_target_weight, templates
 
 
 def _raw() -> dict:
@@ -91,6 +91,60 @@ class PositionTargetWebTests(unittest.TestCase):
             sizing = store.snapshot(raw)["positions"][0]["sizing"]
             self.assertEqual(sizing["target_main_weight"], 0.18)
             self.assertEqual(sizing["max_single_position_weight"], 0.25)
+
+    def test_watchlist_renders_copper_derivative_profile_and_option_review(self):
+        with TemporaryDirectory() as directory:
+            raw = _raw()
+            raw["portfolio"]["positions"] = []
+            store = PortfolioStore(Path(directory) / "portfolio.db")
+            store.add_watchlist(
+                symbol="600362.SH", name="江西铜业", sector="copper",
+                analysis_profile={
+                    "coverage": "full", "coverage_label": "完整跟踪",
+                    "sector_label": "铜产业",
+                    "related_derivatives": [{
+                        "kind": "commodity_option", "exchange": "SHFE",
+                        "product": "CU", "label": "沪铜期权", "role": "auxiliary",
+                    }],
+                },
+                commodity_exposures=[{
+                    "commodity": "copper", "commodity_label": "铜",
+                    "exposure_types": ["mining"],
+                    "sensitivity": "资源端仍需核对产量、成本与套保",
+                }],
+            )
+            audit = [{
+                "timestamp": "2026-08-17T14:15:00+08:00", "node": "14:15",
+                "decision": "NO_ALERT", "signals": [],
+                "summaries": [{
+                    "symbol": "600362.SH", "status": "NO_ALERT",
+                    "commodity_option_status": "fresh",
+                    "commodity_option_view": "balanced",
+                    "commodity_option_summary": "沪铜期权近ATM双边结构均衡。",
+                }],
+            }]
+            context = _context(
+                _request(), raw, store, workspace_id="demo",
+                audit_records=audit, latest_summary=None,
+                llm_available=False, llm_model="",
+            )
+            html = templates.get_template("watchlist.html").render(context)
+            self.assertIn("沪铜期权 · 辅助观察", html)
+            self.assertIn("权利金涨跌不等同商品期货或个股涨跌", html)
+            self.assertIn("期权辅助：沪铜期权近ATM双边结构均衡", html)
+
+    def test_review_rows_keep_option_context_out_of_trading_reason(self):
+        records = _review_records([{
+            "timestamp": "2026-08-17T14:15:00+08:00", "node": "14:15",
+            "decision": "NO_ALERT", "signals": [], "summaries": [{
+                "symbol": "600362.SH", "status": "NO_ALERT", "price": 47.0,
+                "commodity_option_status": "fresh",
+                "commodity_option_summary": "沪铜期权辅助结论",
+            }],
+        }], [{"symbol": "600362.SH", "name": "江西铜业"}])
+        row = records[0]["review_rows"][0]
+        self.assertEqual(row["commodity_option_summary"], "沪铜期权辅助结论")
+        self.assertNotIn("期权", row["reason"])
 
 
 if __name__ == "__main__":

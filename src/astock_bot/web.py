@@ -223,6 +223,15 @@ def _review_records(
                 "status": str(row.get("status", "")),
                 "price": row.get("price"),
                 "change_pct": row.get("change_pct"),
+                "commodity_option_status": row.get(
+                    "commodity_option_status", "not_applicable"
+                ),
+                "commodity_option_view": row.get(
+                    "commodity_option_view", "unavailable"
+                ),
+                "commodity_option_summary": row.get(
+                    "commodity_option_summary", "商品期权不适用"
+                ),
             })
         if not rows:
             for signal in signals:
@@ -238,6 +247,15 @@ def _review_records(
                     "status": "ALERT",
                     "price": signal.get("price"),
                     "change_pct": (signal.get("details") or {}).get("change_pct"),
+                    "commodity_option_status": (signal.get("details") or {}).get(
+                        "commodity_option_status", "not_applicable"
+                    ),
+                    "commodity_option_view": (signal.get("details") or {}).get(
+                        "commodity_option_view", "unavailable"
+                    ),
+                    "commodity_option_summary": (signal.get("details") or {}).get(
+                        "commodity_option_summary", "商品期权不适用"
+                    ),
                 })
         record["review_rows"] = rows
         record["review_count"] = len(rows)
@@ -625,6 +643,7 @@ def add_watchlist(
             sector=result.sector,
             peers=result.peers,
             analysis_profile=result.analysis_profile,
+            commodity_exposures=result.commodity_exposures,
         )
     except (PortfolioStoreError, OSError, ValueError) as exc:
         return _redirect(workspace_id, "/watchlist", error=str(exc))

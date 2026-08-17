@@ -89,6 +89,57 @@ evidence:
     negative_trend_ratio: -0.006
     warrant_enabled: true
     warrant_change_ratio: 0.03
+  gold:
+    max_age_calendar_days: 4
+    trend_lookback_sessions: 3
+    positive_change_ratio: 0.003
+    negative_change_ratio: -0.003
+    positive_trend_ratio: 0.004
+    negative_trend_ratio: -0.006
+  silver:
+    max_age_calendar_days: 4
+    trend_lookback_sessions: 3
+    positive_change_ratio: 0.003
+    negative_change_ratio: -0.003
+    positive_trend_ratio: 0.004
+    negative_trend_ratio: -0.006
+  # 商品期权是独立辅助层：不进入产业方向聚合，不替代期货门控，也不单独触发交易。
+  # 使用上期所日终期权链；权利金涨跌不可等同于标的期货或股票涨跌。
+  commodity_options:
+    enabled: true
+    routes:
+      copper:
+        commodity: copper
+        industry_sector: copper
+        exchange: SHFE
+        futures_product: cu
+        option_product: cu_o
+        label: 沪铜
+      gold:
+        commodity: gold
+        industry_sector: gold
+        exchange: SHFE
+        futures_product: au
+        option_product: au_o
+        label: 沪金
+      silver:
+        commodity: silver
+        industry_sector: silver
+        exchange: SHFE
+        futures_product: ag
+        option_product: ag_o
+        label: 沪银
+    max_age_calendar_days: 4
+    min_days_to_expiry: 7
+    max_days_to_expiry: 90
+    max_moneyness_ratio: 0.12
+    min_volume: 5
+    min_open_interest: 50
+    minimum_paired_strikes: 3
+    risk_free_rate: 0.015
+    volatility_expansion_threshold: 0.03
+    put_call_low: 0.70
+    put_call_high: 1.30
   insurance:
     max_age_calendar_days: 4
     positive_daily_bp: 1.0
