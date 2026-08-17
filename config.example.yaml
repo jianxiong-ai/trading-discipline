@@ -85,7 +85,7 @@ evidence:
     trend_lookback_sessions: 3
     positive_change_ratio: 0.003
     negative_change_ratio: -0.003
-    positive_trend_ratio: 0.006
+    positive_trend_ratio: 0.004
     negative_trend_ratio: -0.006
     warrant_enabled: true
     warrant_change_ratio: 0.03
@@ -264,6 +264,9 @@ strategic_rules:
   require_aligned_short_trend: true
   breakout_retest_tolerance_ratio: 0.002
   breakout_stop_buffer_ratio: 0.010
+  # 主仓/观察仓突破：标准量比门槛；双15分钟站稳压力时可降至 breakout_relaxed_volume_ratio。
+  volume_confirmation_ratio: 1.10
+  breakout_relaxed_volume_ratio: 0.72
   minimum_expected_spread_ratio: 0.04
   minimum_reward_risk: 1.80
   max_remaining_risk_capacity_fraction: 0.10

@@ -646,7 +646,7 @@ class OfficialEvidenceCollector:
         change_ratio = change / previous
         positive = float(settings.get("positive_change_ratio", 0.003))
         negative = float(settings.get("negative_change_ratio", -0.003))
-        positive_trend = float(settings.get("positive_trend_ratio", 0.006))
+        positive_trend = float(settings.get("positive_trend_ratio", 0.004))
         negative_trend = float(settings.get("negative_trend_ratio", -0.006))
         delivery_month = str(main.get("DELIVERYMONTH"))
         settlements: list[tuple[date, float]] = []

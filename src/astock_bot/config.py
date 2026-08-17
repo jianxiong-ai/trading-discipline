@@ -613,6 +613,13 @@ def _validate_config(raw: dict[str, Any], positions: list[Position]) -> None:
     )
     if not 2 <= high_confirmations <= 3:
         raise ValueError("strategic_rules.high_break_minimum_weak_confirmations 必须在[2, 3]之间")
+    breakout_volume = float(strategic.get("volume_confirmation_ratio", 1.10))
+    relaxed_volume = float(strategic.get("breakout_relaxed_volume_ratio", 0.72))
+    if not 0.5 <= relaxed_volume <= breakout_volume <= 2.0:
+        raise ValueError(
+            "strategic_rules 突破量比须满足 0.5 <= breakout_relaxed_volume_ratio"
+            " <= volume_confirmation_ratio <= 2.0"
+        )
     notification = raw.get("notification", {})
     evidence_limit = int(notification.get("evidence_char_limit", 240))
     margin_limit = int(notification.get("margin_char_limit", 120))

@@ -348,7 +348,7 @@ def _watchlist_entry_signal(
     )
     short_trend_ready = _short_trend_ready(quote, tech, strategic_rules)
     trend_ready = bool(above_ma20 and ma20_slope_ready and short_trend_ready)
-    intraday_confirmed = _confirmed_intraday(tech, rules)
+    intraday_confirmed = _breakout_intraday_confirmed(tech, rules, strategic_rules)
     breakout_persistent = _breakout_persistence(tech, strategic_rules)
     price_above_resistance = quote.price > tech.resistance
     close_above_resistance = bool(
@@ -922,7 +922,7 @@ def _strategic_signal(
     if bottom_reentry:
         return bottom_reentry
 
-    data_ready = _confirmed_intraday(tech, rules)
+    data_ready = _breakout_intraday_confirmed(tech, rules, strategic_rules)
     evidence_ready = bool(evidence and evidence.add_ready)
     enough_confirmations = strong_count >= int(
         strategic_rules.get("minimum_strong_confirmations", 2)
@@ -2397,6 +2397,34 @@ def _intraday_data_ready(tech: Technicals, rules: dict) -> bool:
         and tech.vwap is not None
         and tech.volume_ratio is not None
         and tech.volume_baseline_samples >= int(rules.get("minimum_volume_baseline_samples", 3))
+    )
+
+
+def _volume_confirmation_ratio(strategic_rules: dict, rules: dict) -> float:
+    if "volume_confirmation_ratio" in strategic_rules:
+        return float(strategic_rules["volume_confirmation_ratio"])
+    return float(rules.get("volume_confirmation_ratio", 1.3))
+
+
+def _breakout_intraday_confirmed(
+    tech: Technicals,
+    rules: dict,
+    strategic_rules: dict,
+) -> bool:
+    """Confirm breakouts with standard volume or a relaxed, persistence-backed path."""
+    if not _intraday_data_ready(tech, rules):
+        return False
+    volume_ratio = float(tech.volume_ratio or 0)
+    if volume_ratio >= _volume_confirmation_ratio(strategic_rules, rules):
+        return True
+    relaxed = float(strategic_rules.get("breakout_relaxed_volume_ratio", 0.72))
+    if volume_ratio < relaxed:
+        return False
+    if not _breakout_persistence(tech, strategic_rules):
+        return False
+    return bool(
+        tech.last_15m_close is not None
+        and tech.last_15m_close > tech.resistance
     )
 
 

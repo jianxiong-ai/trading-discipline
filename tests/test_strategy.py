@@ -424,6 +424,60 @@ class StrategyTests(unittest.TestCase):
         signals = evaluate_position(*common, equity_evidence(1))
         self.assertEqual([signal.code for signal in signals], ["UP_BREAK"])
 
+    def test_main_add_accepts_relaxed_volume_when_breakout_persists(self):
+        breakout = tech(
+            support=39, resistance=41, vwap=40, volume_ratio=0.75,
+            close=41.2, previous=41.1, open_=41.0, last_low=41.05,
+        )
+        signals = evaluate_position(
+            position(), quote(41.2), breakout, "14:15", 0.01, 0.01, date(2026, 7, 28),
+            {}, {"max_loss_ratio": 0.99, "warning_ratio": 0.90}, set(), 100000, 0.10,
+            180000, None, None,
+            {
+                "main_add_enabled": True,
+                "volume_confirmation_ratio": 1.10,
+                "breakout_relaxed_volume_ratio": 0.72,
+            },
+            0, equity_evidence(1),
+        )
+        self.assertEqual([signal.code for signal in signals], ["UP_BREAK"])
+
+    def test_main_add_rejects_relaxed_volume_without_two_bar_persistence(self):
+        breakout = tech(
+            support=39, resistance=41, vwap=40, volume_ratio=0.75,
+            close=41.2, previous=40.8, open_=40.9, last_low=41.15,
+        )
+        signals = evaluate_position(
+            position(), quote(41.2), breakout, "14:15", 0.01, 0.01, date(2026, 7, 28),
+            {}, {"max_loss_ratio": 0.99, "warning_ratio": 0.90}, set(), 100000, 0.10,
+            180000, None, None,
+            {
+                "main_add_enabled": True,
+                "volume_confirmation_ratio": 1.10,
+                "breakout_relaxed_volume_ratio": 0.72,
+            },
+            0, equity_evidence(1),
+        )
+        self.assertEqual(signals, [])
+
+    def test_main_add_rejects_volume_below_relaxed_floor_even_with_persistence(self):
+        breakout = tech(
+            support=39, resistance=41, vwap=40, volume_ratio=0.67,
+            close=41.2, previous=41.1, open_=41.0, last_low=41.05,
+        )
+        signals = evaluate_position(
+            position(), quote(41.2), breakout, "14:15", 0.01, 0.01, date(2026, 7, 28),
+            {}, {"max_loss_ratio": 0.99, "warning_ratio": 0.90}, set(), 100000, 0.10,
+            180000, None, None,
+            {
+                "main_add_enabled": True,
+                "volume_confirmation_ratio": 1.10,
+                "breakout_relaxed_volume_ratio": 0.72,
+            },
+            0, equity_evidence(1),
+        )
+        self.assertEqual(signals, [])
+
     def test_main_add_is_evaluated_at_1315(self):
         breakout = tech(
             support=39, resistance=41, vwap=40, volume_ratio=1.5,
