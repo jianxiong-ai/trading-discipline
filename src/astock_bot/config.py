@@ -673,6 +673,48 @@ def _validate_config(raw: dict[str, Any], positions: list[Position]) -> None:
             "strategic_rules 突破量比须满足 0.5 <= breakout_relaxed_volume_ratio"
             " <= volume_confirmation_ratio <= 2.0"
         )
+    gap_high_volume = float(
+        strategic.get("gap_high_confidence_min_volume_ratio", 1.0)
+    )
+    if not 0.5 <= gap_high_volume <= 2.0:
+        raise ValueError(
+            "strategic_rules.gap_high_confidence_min_volume_ratio 必须在[0.5, 2.0]之间"
+        )
+    false_break = raw.get("false_break_rules", {})
+    if false_break:
+        mode = str(false_break.get("peer_stability_mode", "relaxed_average"))
+        if mode not in {"relaxed_average", "best_peer", "none"}:
+            raise ValueError(
+                "false_break_rules.peer_stability_mode 必须是 "
+                "relaxed_average、best_peer 或 none"
+            )
+        reclaim_volume = float(false_break.get("reclaim_max_volume_ratio", 1.0))
+        if not 0 < reclaim_volume <= 2.0:
+            raise ValueError(
+                "false_break_rules.reclaim_max_volume_ratio 必须在(0, 2.0]之间"
+            )
+    quality_gates = raw.get("reduce_quality_gates", {})
+    if quality_gates:
+        allowed_keys = {
+            "low_volume_break",
+            "support_reclaimed",
+            "holder_concentrating",
+            "peer_not_weak_together",
+            "options_balanced",
+        }
+        counted = quality_gates.get("counted_observations")
+        if counted is not None:
+            if not isinstance(counted, list) or not counted:
+                raise ValueError("reduce_quality_gates.counted_observations 必须为非空列表")
+            unknown = [key for key in counted if key not in allowed_keys]
+            if unknown:
+                raise ValueError(
+                    "reduce_quality_gates.counted_observations 含未知项: "
+                    + ", ".join(unknown)
+                )
+        for key in ("max_divergences_for_high_confidence", "max_divergences_for_trigger"):
+            if quality_gates.get(key) is not None and int(quality_gates[key]) < 0:
+                raise ValueError(f"reduce_quality_gates.{key} 不得小于0")
     notification = raw.get("notification", {})
     evidence_limit = int(notification.get("evidence_char_limit", 240))
     margin_limit = int(notification.get("margin_char_limit", 120))

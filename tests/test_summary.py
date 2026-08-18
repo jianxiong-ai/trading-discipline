@@ -138,6 +138,37 @@ class DailySummaryTests(unittest.TestCase):
         self.assertIn("暂停首次建仓", MonitorService._summary_recommendation(summary, "watchlist"))
         self.assertIn("负向证据", MonitorService._summary_reason(summary))
 
+    def test_summary_reason_includes_reduce_counter_observations(self):
+        reason = MonitorService._summary_reason({
+            "role": "holding",
+            "status": "NO_ALERT",
+            "price": 46.60,
+            "support": 46.46,
+            "resistance": 47.74,
+            "change_pct": -2.35,
+            "peer_change_pct": -1.09,
+            "peer_snapshots": [
+                {"symbol": "601899.SH", "change_pct": 0.60},
+                {"symbol": "000630.SZ", "change_pct": -1.62},
+            ],
+            "vwap": 46.39,
+            "volume_ratio": 0.50,
+            "stage": {"label": "NEUTRAL"},
+            "shareholder_signal": "concentrating",
+            "commodity_option_status": "fresh",
+            "commodity_option_view": "balanced",
+            "checks": {
+                "main_reduce": {
+                    "below_support": {"passed": True},
+                    "break_depth_or_persistence": {"passed": True},
+                }
+            },
+            "metrics": {"main_reduce": {"gap_exception": True}},
+        })
+        self.assertIn("反向观察", reason)
+        self.assertIn("最新价已站回支撑46.46", reason)
+        self.assertIn("601899.SH", reason)
+
     def test_near_entry_reminder_is_not_counted_as_an_action_signal(self):
         with TemporaryDirectory() as directory:
             service = MonitorService(self._config(Path(directory)))

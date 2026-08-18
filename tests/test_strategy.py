@@ -1,14 +1,22 @@
 from datetime import date, datetime
 import unittest
+from dataclasses import replace
 from zoneinfo import ZoneInfo
 
 from astock_bot.models import EquityEvidence, Position, Quote, SatellitePosition, Technicals
 from astock_bot.strategy import (
     _entry_risk_budget,
+    _gap_qualifies_for_high_confidence,
     _planned_main_entry_shares,
     _planned_satellite_entry_shares,
     _strong_confirmation_count,
+    apply_reduce_quality_gates,
     evaluate_position,
+    low_volume_reclaim_bypasses_peers,
+    peers_stable_for_false_break,
+    reduce_quality_flags,
+    reduce_quality_observations,
+    reduce_summary_context,
     trading_days_held,
 )
 
@@ -529,6 +537,25 @@ class StrategyTests(unittest.TestCase):
         )
         self.assertEqual([signal.code for signal in signals], ["DOWN_BREAK"])
         self.assertTrue(signals[0].details["gap_exception"])
+        self.assertEqual(signals[0].confidence, "中")
+        self.assertEqual(signals[0].shares, 200)
+
+    def test_gap_down_with_high_volume_can_stay_high_confidence(self):
+        weak = tech(
+            support=39.5, resistance=42, vwap=39.0, volume_ratio=1.5,
+            close=38.5, previous=38.8, open_=38.7,
+        )
+        gap_quote = Quote(
+            "600362.SH", "江西铜业", datetime(2026, 7, 28, 10, 15, tzinfo=TZ),
+            38.5, 40.0, 38.7, 38.8, 38.2, 1, 1,
+        )
+        signals = evaluate_position(
+            position(), gap_quote, weak, "10:15", -0.01, 0.0, date(2026, 7, 28),
+            {}, {"max_loss_ratio": 0.99, "warning_ratio": 0.90}, set(), 100000, 0.20, 180000,
+            None, None, {"emergency_gap_down_ratio": 0.02}, 0, equity_evidence(0),
+        )
+        self.assertEqual(signals[0].confidence, "高")
+        self.assertEqual(signals[0].shares, 400)
 
     def test_main_add_requires_room_to_next_resistance_and_reward_risk(self):
         breakout = tech(
@@ -1467,6 +1494,188 @@ class StrategyTests(unittest.TestCase):
             _strong_confirmation_count(None, None, concentrating, {}),
             1,
         )
+
+
+class ReduceQualityObservationTests(unittest.TestCase):
+    def test_reduce_quality_observations_cover_jiangxi_like_case(self):
+        notes = reduce_quality_observations(
+            price=46.60,
+            support=46.46,
+            volume_ratio=0.50,
+            stock_change=-0.0235,
+            peer_change=-0.0109,
+            peer_snapshots=[("601899.SH", 0.006), ("000630.SZ", -0.0162)],
+            shareholder_signal="concentrating",
+            commodity_option_view="balanced",
+            commodity_option_status="fresh",
+            below_support_at_node=True,
+            gap_exception=True,
+        )
+        self.assertIn("跳空触发但同时间量能偏低（0.50），破位质量偏弱", notes)
+        self.assertIn("最新价已站回支撑46.46，假跌破风险上升", notes)
+        self.assertIn("筹码集中与减仓方向背离", notes)
+        self.assertIn("板块未集体走弱（601899.SH +0.60%）", notes)
+        self.assertIn("期权层结构均衡，未见恐慌性对冲", notes)
+
+    def test_reduce_summary_context_detects_reclaimed_support(self):
+        summary = {
+            "role": "holding",
+            "price": 46.60,
+            "support": 46.46,
+            "checks": {
+                "main_reduce": {
+                    "below_support": {"passed": True},
+                    "break_depth_or_persistence": {"passed": True},
+                }
+            },
+        }
+        self.assertTrue(reduce_summary_context(summary))
+
+    def test_gap_down_signal_includes_counter_observations(self):
+        weak = tech(
+            support=39.5, resistance=42, vwap=39.0, volume_ratio=0.8,
+            close=38.5, previous=38.8, open_=38.7,
+        )
+        gap_quote = Quote(
+            "600362.SH", "江西铜业", datetime(2026, 7, 28, 10, 15, tzinfo=TZ),
+            38.5, 40.0, 38.7, 38.8, 38.2, 1, 1,
+        )
+        signals = evaluate_position(
+            position(), gap_quote, weak, "10:15", -0.01, 0.0, date(2026, 7, 28),
+            {}, {"max_loss_ratio": 0.99, "warning_ratio": 0.90}, set(), 100000, 0.20, 180000,
+            None, None, {"emergency_gap_down_ratio": 0.02}, 0, equity_evidence(0),
+            peer_snapshots=[("601899.SH", 0.006)],
+        )
+        self.assertEqual(signals[0].code, "DOWN_BREAK")
+        self.assertTrue(signals[0].details["counter_observations"])
+        self.assertIn("反向观察", signals[0].reason)
+
+
+class GapAndFalseBreakGateTests(unittest.TestCase):
+    def test_gap_high_confidence_requires_volume_by_default(self):
+        self.assertFalse(_gap_qualifies_for_high_confidence(
+            True, False, 0.8, True, {}, {},
+        ))
+        self.assertTrue(_gap_qualifies_for_high_confidence(
+            True, False, 1.2, True, {}, {},
+        ))
+
+    def test_relaxed_peer_floor_allows_slightly_weak_sector(self):
+        stable, note = peers_stable_for_false_break(
+            -0.0109,
+            [("601899.SH", 0.006)],
+            {"enabled": True, "peer_stability_mode": "relaxed_average", "peer_minimum": -0.015},
+            {"peer_weak_ratio": 0.0},
+        )
+        self.assertTrue(stable)
+        self.assertIn("同行均值", note)
+
+    def test_low_volume_reclaim_bypasses_peer_gate(self):
+        rules = {
+            "enabled": True,
+            "low_volume_reclaim_bypass_peers": True,
+            "reclaim_max_volume_ratio": 1.0,
+        }
+        self.assertTrue(low_volume_reclaim_bypasses_peers(True, 0.50, rules))
+        self.assertFalse(low_volume_reclaim_bypasses_peers(True, 1.5, rules))
+
+
+class ReduceQualityGateTests(unittest.TestCase):
+    DEFAULT_GATES = {
+        "enabled": True,
+        "max_divergences_for_high_confidence": 0,
+        "max_divergences_for_trigger": None,
+    }
+
+    def test_any_quality_flag_caps_high_confidence(self):
+        flags = [("low_volume_break", "缩量破位")]
+        triggered, high, texts = apply_reduce_quality_gates(
+            True, True, flags, {"reduce_quality_gates": self.DEFAULT_GATES},
+        )
+        self.assertTrue(triggered)
+        self.assertFalse(high)
+        self.assertEqual(texts, ["缩量破位"])
+
+    def test_excess_flags_can_suppress_down_break_when_configured(self):
+        flags = [
+            ("low_volume_break", "a"),
+            ("holder_concentrating", "b"),
+        ]
+        triggered, high, _ = apply_reduce_quality_gates(
+            True,
+            True,
+            flags,
+            {"reduce_quality_gates": {
+                **self.DEFAULT_GATES,
+                "max_divergences_for_trigger": 1,
+            }},
+        )
+        self.assertFalse(triggered)
+
+    def test_critical_announcement_bypasses_quality_gates(self):
+        flags = [("low_volume_break", "a"), ("holder_concentrating", "b")]
+        triggered, high, _ = apply_reduce_quality_gates(
+            True,
+            True,
+            flags,
+            {"reduce_quality_gates": {
+                **self.DEFAULT_GATES,
+                "max_divergences_for_trigger": 0,
+            }},
+            critical=True,
+        )
+        self.assertTrue(triggered)
+        self.assertTrue(high)
+
+    def test_deep_break_stays_high_without_quality_flags(self):
+        deep = tech(
+            support=62.41, resistance=63.32, vwap=62.79, volume_ratio=2.79,
+            close=62.00, previous=62.20, open_=62.50, atr14=2.11,
+        )
+        current = Quote(
+            "600362.SH", "江西铜业", datetime(2026, 7, 30, 13, 30, tzinfo=TZ),
+            62.00, 62.98, 62.96, 63.00, 61.90, 1, 1,
+        )
+        signals = evaluate_position(
+            position(main_shares=1000), current, deep, "13:15",
+            -0.01, -0.02788, date(2026, 7, 30), {},
+            {"max_loss_ratio": 0.99, "warning_ratio": 0.90}, set(),
+            100000, 0.20, 180000, None, None,
+            {
+                "high_break_minimum_weak_confirmations": 2,
+                "reduce_quality_gates": self.DEFAULT_GATES,
+            },
+            0, equity_evidence(0),
+        )
+        self.assertEqual(signals[0].confidence, "高")
+
+    def test_quality_gate_caps_otherwise_high_confidence_break(self):
+        deep = tech(
+            support=62.41, resistance=63.32, vwap=62.79, volume_ratio=2.79,
+            close=62.00, previous=62.20, open_=62.50, atr14=2.11,
+        )
+        current = Quote(
+            "600362.SH", "江西铜业", datetime(2026, 7, 30, 13, 30, tzinfo=TZ),
+            62.00, 62.98, 62.96, 63.00, 61.90, 1, 1,
+        )
+        concentrating = replace(
+            equity_evidence(0),
+            shareholder_status="fresh",
+            shareholder_signal="concentrating",
+        )
+        signals = evaluate_position(
+            position(main_shares=1000), current, deep, "13:15",
+            -0.01, -0.02788, date(2026, 7, 30), {},
+            {"max_loss_ratio": 0.99, "warning_ratio": 0.90}, set(),
+            100000, 0.20, 180000, None, None,
+            {
+                "high_break_minimum_weak_confirmations": 2,
+                "reduce_quality_gates": self.DEFAULT_GATES,
+            },
+            0, concentrating,
+        )
+        self.assertEqual(signals[0].confidence, "中")
+        self.assertTrue(signals[0].details["quality_gate_capped_high"])
 
 
 if __name__ == "__main__":

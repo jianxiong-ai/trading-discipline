@@ -16,7 +16,14 @@ from .models import Signal
 from .notifier import FeishuNotifier, render_daily_summary, render_message
 from .portfolio_store import PortfolioStore
 from .state import StateStore
-from .strategy import evaluate_position, overheat_watch_signal
+from .strategy import (
+    evaluate_position,
+    overheat_watch_signal,
+    low_volume_reclaim_bypasses_peers,
+    peers_stable_for_false_break,
+    reduce_quality_observations,
+    reduce_summary_context,
+)
 
 
 class MonitorService:
@@ -140,6 +147,7 @@ class MonitorService:
         signals: list[Signal],
         technical_fresh: bool,
         allow_state_update: bool,
+        preserve_active_reduction: bool = False,
     ) -> None:
         """Persist an active reduction and clear its dedupe when it resolves.
 
@@ -172,6 +180,8 @@ class MonitorService:
                 "key_level": current.key_level,
                 "position_main_shares": int(current.details.get("position_main_shares", position.main_shares) or position.main_shares),
             })
+            return
+        if preserve_active_reduction:
             return
         if active.get("code") in self._PERSISTENT_REDUCTION_CODES:
             old_key = str(active.get("semantic_key") or active.get("event_id", "")).split("|", 1)[-1]
@@ -414,6 +424,11 @@ class MonitorService:
                     quotes[x].change_ratio for x in position.peers
                     if x in quotes and self._is_fresh(quotes[x], now, max_delay)
                 ]
+                peer_snapshots = [
+                    (x, quotes[x].change_ratio)
+                    for x in position.peers
+                    if x in quotes and self._is_fresh(quotes[x], now, max_delay)
+                ]
                 index_changes = [
                     quotes[x].change_ratio for x in self.config.raw.get("market_indices", [])
                     if x in quotes and self._is_fresh(quotes[x], now, max_delay)
@@ -458,7 +473,7 @@ class MonitorService:
                     portfolio_value,
                     correlated_weight,
                     correlated_cap,
-                    self.config.section("strategic_rules"),
+                    self._strategic_rules(),
                     active_satellite_count,
                     equity_evidence,
                     self.config.section("stage_rules"),
@@ -470,6 +485,7 @@ class MonitorService:
                     self.config.section("watchlist_rules"),
                     self.config.section("execution_constraints"),
                     self.config.section("liquidity"),
+                    peer_snapshots=peer_snapshots,
                 )
                 resolved = self._resolved_down_break_signal(
                     position,
@@ -477,6 +493,7 @@ class MonitorService:
                     tech,
                     now.date(),
                     peer_change,
+                    peer_snapshots,
                     found,
                     technical_fresh,
                     allow_state_update=not dry_run,
@@ -512,7 +529,15 @@ class MonitorService:
                     if memory_update:
                         self.state.save_stage_state(position.symbol, memory_update)
                 self._sync_reduction_lifecycle(
-                    position, found, technical_fresh, allow_state_update=not dry_run
+                    position,
+                    found,
+                    technical_fresh,
+                    allow_state_update=not dry_run,
+                    preserve_active_reduction=bool(
+                        diagnostics.get("metrics", {})
+                        .get("main_reduce", {})
+                        .get("quality_gate_suppressed")
+                    ),
                 )
                 for signal in found:
                     signal.details["change_pct"] = quote.change_ratio * 100
@@ -541,6 +566,10 @@ class MonitorService:
                     "range_position_60": tech.range_position_60,
                     "ma20_slope_5d": tech.ma20_slope_5d,
                     "peer_change_pct": peer_change * 100 if peer_change is not None else None,
+                    "peer_snapshots": [
+                        {"symbol": symbol, "change_pct": change * 100}
+                        for symbol, change in peer_snapshots
+                    ],
                     "market_change_pct": market_change * 100 if market_change is not None else None,
                     "stage": diagnostics.get("stage", {}),
                     "checks": diagnostics.get("checks", {}),
@@ -1180,7 +1209,50 @@ class MonitorService:
         elif holder_signal == "dispersing":
             details.append("股东户数上升（筹码分散）")
         base = stage_prefix or structure
-        return base + ("；" + "、".join(details) if details else "")
+        text = base + ("；" + "、".join(details) if details else "")
+        if reduce_summary_context(summary):
+            main_reduce = metrics.get("main_reduce", {}) or {}
+            checks_main_reduce = checks.get("main_reduce", {}) or {}
+            below_at_node = bool(
+                isinstance(checks_main_reduce.get("below_support"), dict)
+                and checks_main_reduce["below_support"].get("passed")
+            )
+            peer_snapshot_pairs = [
+                (item["symbol"], float(item["change_pct"]) / 100.0)
+                for item in (summary.get("peer_snapshots") or [])
+                if item.get("symbol") is not None and item.get("change_pct") is not None
+            ]
+            stock_change = summary.get("change_pct")
+            peer_change_ratio = summary.get("peer_change_pct")
+            counter = reduce_quality_observations(
+                price=float(price),
+                support=float(support),
+                volume_ratio=(
+                    float(volume_ratio) if volume_ratio is not None else None
+                ),
+                volume_threshold=1.30,
+                stock_change=(
+                    float(stock_change) / 100.0
+                    if stock_change is not None else None
+                ),
+                peer_change=(
+                    float(peer_change_ratio) / 100.0
+                    if peer_change_ratio is not None else None
+                ),
+                peer_snapshots=peer_snapshot_pairs or None,
+                shareholder_signal=str(summary.get("shareholder_signal", "missing")),
+                commodity_option_view=str(
+                    summary.get("commodity_option_view", "unavailable")
+                ),
+                commodity_option_status=str(
+                    summary.get("commodity_option_status", "not_applicable")
+                ),
+                below_support_at_node=below_at_node,
+                gap_exception=bool(main_reduce.get("gap_exception")),
+            )
+            if counter:
+                text += "；反向观察：" + "、".join(counter)
+        return text
 
     def _filter_sendable(
         self, signals: list[Signal], now: datetime
@@ -1242,6 +1314,7 @@ class MonitorService:
         tech,
         today,
         peer_change,
+        peer_snapshots: list[tuple[str, float]] | None,
         current_signals: list[Signal],
         technical_fresh: bool,
         allow_state_update: bool,
@@ -1271,9 +1344,29 @@ class MonitorService:
             and tech.last_15m_close > key_level
             and quote.price > key_level
         )
-        peer_floor = float(self.config.section("strategic_rules").get("peer_weak_ratio", 0.0))
-        peers_stable = peer_change is not None and peer_change >= peer_floor
-        if not (recovered and peers_stable):
+        if not recovered:
+            return None
+        false_break_rules = self.config.section("false_break_rules")
+        strategic_rules = self.config.section("strategic_rules")
+        peers_stable, peer_note = peers_stable_for_false_break(
+            peer_change,
+            peer_snapshots,
+            false_break_rules,
+            strategic_rules,
+        )
+        if low_volume_reclaim_bypasses_peers(
+            recovered,
+            tech.volume_ratio,
+            false_break_rules,
+        ):
+            peers_stable = True
+            volume_text = (
+                f"{float(tech.volume_ratio):.2f}"
+                if tech.volume_ratio is not None
+                else "暂缺"
+            )
+            peer_note = f"缩量收回支撑（量能比{volume_text}）"
+        if not peers_stable:
             return None
         return Signal(
             symbol=position.symbol,
@@ -1285,8 +1378,7 @@ class MonitorService:
             action="撤销此前减仓建议，恢复观察",
             shares=0,
             reason=(
-                f"完整15分钟重新站回{key_level:.2f}上方，同行均值"
-                f"{peer_change:+.2%}，此前破位未延续"
+                f"完整15分钟重新站回{key_level:.2f}上方，{peer_note}，此前破位未延续"
             ),
             invalidation="若再次出现深度或连续15分钟破位，且外部证据同步走弱，再重新评估",
             event_id=f"{today.isoformat()}|{position.symbol}:FALSE_BREAK:{key_level:.2f}",
@@ -1295,6 +1387,11 @@ class MonitorService:
                 "previous_event_id": active.get("event_id"),
                 "evidence": "关键位已收复且同行止跌",
                 "position_main_shares": position.main_shares,
+                "low_volume_reclaim": low_volume_reclaim_bypasses_peers(
+                    recovered,
+                    tech.volume_ratio,
+                    false_break_rules,
+                ),
             },
         )
 
@@ -1685,6 +1782,17 @@ class MonitorService:
             }
             for item in evidence.items
         ]
+
+    @staticmethod
+    def _strategic_rules_for(config) -> dict:
+        rules = dict(config.section("strategic_rules"))
+        gates = config.section("reduce_quality_gates")
+        if gates:
+            rules["reduce_quality_gates"] = gates
+        return rules
+
+    def _strategic_rules(self) -> dict:
+        return self._strategic_rules_for(self.config)
 
     @staticmethod
     def _commodity_option_fields(evidence) -> dict:

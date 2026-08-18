@@ -90,6 +90,18 @@ def render_message(
                 )
             if evidence_lines:
                 lines.extend(["", "【证据】", *evidence_lines])
+        counter_observations = [
+            str(item).strip()
+            for item in (signal.details.get("counter_observations") or [])
+            if str(item).strip()
+        ]
+        if counter_observations and signal.code in {"DOWN_BREAK", "STAGE_TOP_EXIT", "MIGRATION_TRIM", "MIGRATION_RECOVERY_TRIM"}:
+            lines.extend([
+                "",
+                "【反向观察】",
+                _clip("；".join(counter_observations), 220),
+                "说明：仅评估本次减仓/降风险建议的质量，不改变已触发的纪律动作。",
+            ])
         option_status = str(
             signal.details.get("commodity_option_status") or "not_applicable"
         )

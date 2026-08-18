@@ -151,6 +151,26 @@ class NotifierTests(unittest.TestCase):
             text,
         )
 
+    def test_counter_observations_are_rendered_for_down_break(self):
+        signal = Signal(
+            symbol="600362.SH", name="江西铜业", code="DOWN_BREAK", confidence="高",
+            price=46.28, key_level=46.46, action="分批降低主仓", shares=400,
+            reason="向下跳空后未收回支撑；反向观察：缩量破位（量能比0.50），抛压确认不足",
+            invalidation="重新站回46.46",
+            event_id="down-break-counter", category="strategy",
+            details={
+                "change_pct": -3.02,
+                "counter_observations": [
+                    "跳空触发但同时间量能偏低（0.50），破位质量偏弱",
+                    "筹码集中与减仓方向背离",
+                ],
+            },
+        )
+        text = render_message([signal], "14:15", "A股持仓纪律")
+        self.assertIn("【反向观察】", text)
+        self.assertIn("破位质量偏弱", text)
+        self.assertIn("不改变已触发的纪律动作", text)
+
     def test_commodity_option_context_is_separate_and_non_actionable(self):
         signal = Signal(
             symbol="600362.SH", name="江西铜业", code="UP_BREAK", confidence="中",

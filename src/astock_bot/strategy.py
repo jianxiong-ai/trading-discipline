@@ -59,6 +59,7 @@ def evaluate_position(
     watchlist_rules: dict | None = None,
     execution_constraints: dict | None = None,
     liquidity_rules: dict | None = None,
+    peer_snapshots: list[tuple[str, float]] | None = None,
 ) -> list[Signal]:
     strategic_rules = strategic_rules or {}
     stage_rules = stage_rules or {}
@@ -176,6 +177,7 @@ def evaluate_position(
         migration_context=migration_context,
         execution_constraints=execution_constraints,
         liquidity_rules=liquidity_rules,
+        peer_snapshots=peer_snapshots,
     )
     if strategic and strategic.code in {
         "DOWN_BREAK", "STAGE_TOP_EXIT", "MIGRATION_TRIM", "MIGRATION_RECOVERY_TRIM",
@@ -740,9 +742,11 @@ def _strategic_signal(
     migration_context,
     execution_constraints,
     liquidity_rules,
+    peer_snapshots=None,
 ):
     if node not in {"10:15", "13:15", "14:15"}:
         return None
+    peer_snapshots = peer_snapshots or []
     peer_resilient, peer_relative_excess = _peer_relative_strength(
         quote.change_ratio, peer_change, strategic_rules
     )
@@ -765,70 +769,127 @@ def _strategic_signal(
     )
     for name, value in downside["checks"].items():
         _check(diagnostics, "main_reduce", name, value[0], value[1], value[2])
+    diagnostics.setdefault("metrics", {})["main_reduce"] = {
+        "gap_exception": downside["gap_exception"],
+        "gap_auto_high": downside["gap_auto_high"],
+        "persistent_break": downside["persistent_break"],
+        "deep_break": downside["deep_break"],
+        "triggered": downside["triggered"],
+        "high_confidence": downside["high_confidence"],
+    }
     if position.main_shares > 0 and downside["triggered"]:
-        high = bool(downside["high_confidence"])
-        ratio = float(strategic_rules.get(
-            "high_confidence_reduction_ratio" if high else "medium_confidence_reduction_ratio",
-            0.25 if high else 0.15,
-        ))
-        shares = _planned_reduction_shares(position.main_shares, ratio)
-        level = round(tech.support, 2)
-        action = "分批降低主仓"
-        details = {
-            "score": tech.volume_ratio,
-            "volume_samples": tech.volume_baseline_samples,
-            "evidence": _evidence_note(evidence),
-            "gap_exception": downside["gap_exception"],
-            "critical_announcement": downside["critical_announcement"],
-            "reduction_ratio": ratio,
-            "break_depth_ratio": downside["break_depth_ratio"],
-            "break_depth_atr": downside["break_depth_atr"],
-            "persistent_break": downside["persistent_break"],
-            "observation_only": downside["observation_only"],
-            "peer_relative_resilient": peer_resilient,
-            "peer_relative_excess_ratio": peer_relative_excess,
-            "external_confirmations": weak_sources,
-            "external_divergences": external_divergences,
-            "position_main_shares": position.main_shares,
-            "event_rank": 2 if high else 1,
-            **_liquidity_details(tech, shares, liquidity_rules, risk_exit=True),
-        }
-        if position.satellite.active:
-            action = "卫星仓退出，并分批降低主仓"
-            details["satellite_exit_shares"] = position.satellite.shares
-        if downside["gap_exception"]:
-            reason_prefix = "向下跳空后未收回支撑"
-        elif downside["persistent_break"]:
-            reason_prefix = "连续两根完整15分钟K收在动态支撑下方"
-        else:
-            reason_prefix = "完整15分钟深度跌破动态支撑"
-        if downside["critical_announcement"]:
-            reason_prefix += "且公司公告出现高风险事项"
-        external_note = "、".join(weak_sources) if weak_sources else "无"
-        divergence_note = (
-            f"；背离：{'、'.join(external_divergences)}"
-            if external_divergences
-            else ""
-        )
-        return Signal(
-            symbol=position.symbol,
-            name=position.name,
-            code="DOWN_BREAK",
-            confidence="高" if high else "中",
+        quality_flags = reduce_quality_flags(
             price=quote.price,
-            key_level=level,
-            action=action,
-            shares=shares,
-            reason=(
-                f"{reason_prefix}、位于近似分时均价下方；"
-                f"同时间量能{_fmt(tech.volume_ratio)}倍；外部确认：{external_note}"
-                f"{divergence_note}"
+            support=tech.support,
+            volume_ratio=tech.volume_ratio,
+            volume_threshold=float(rules.get("volume_confirmation_ratio", 1.30)),
+            stock_change=quote.change_ratio,
+            peer_change=peer_change,
+            peer_snapshots=peer_snapshots,
+            shareholder_signal=(
+                evidence.shareholder_signal if evidence is not None else "missing"
             ),
-            invalidation=f"完整15分钟重新站回{level:.2f}上方且板块止跌",
-            event_id=f"{today.isoformat()}|{position.symbol}:DOWN_BREAK:{level:.2f}",
-            category="strategy",
-            details=details,
+            commodity_option_view=(
+                evidence.commodity_option_view if evidence is not None else "unavailable"
+            ),
+            commodity_option_status=(
+                evidence.commodity_option_status if evidence is not None else "not_applicable"
+            ),
+            below_support_at_node=True,
+            gap_exception=bool(downside["gap_exception"]),
         )
+        triggered, high, counter_observations = apply_reduce_quality_gates(
+            True,
+            bool(downside["high_confidence"]),
+            quality_flags,
+            strategic_rules,
+            critical=bool(downside["critical_announcement"]),
+        )
+        diagnostics["metrics"]["main_reduce"].update({
+            "quality_divergence_count": len(quality_flags),
+            "quality_gate_suppressed": not triggered,
+            "quality_gate_capped_high": bool(downside["high_confidence"]) and not high,
+        })
+        if not triggered:
+            _check(
+                diagnostics,
+                "main_reduce",
+                "quality_gate",
+                False,
+                len(quality_flags),
+                "反向观察过多，降级为仅观察",
+            )
+        else:
+            ratio = float(strategic_rules.get(
+                "high_confidence_reduction_ratio" if high else "medium_confidence_reduction_ratio",
+                0.25 if high else 0.15,
+            ))
+            shares = _planned_reduction_shares(position.main_shares, ratio)
+            level = round(tech.support, 2)
+            action = "分批降低主仓"
+            details = {
+                "score": tech.volume_ratio,
+                "volume_samples": tech.volume_baseline_samples,
+                "evidence": _evidence_note(evidence),
+                "gap_exception": downside["gap_exception"],
+                "critical_announcement": downside["critical_announcement"],
+                "reduction_ratio": ratio,
+                "break_depth_ratio": downside["break_depth_ratio"],
+                "break_depth_atr": downside["break_depth_atr"],
+                "persistent_break": downside["persistent_break"],
+                "observation_only": downside["observation_only"],
+                "peer_relative_resilient": peer_resilient,
+                "peer_relative_excess_ratio": peer_relative_excess,
+                "external_confirmations": weak_sources,
+                "external_divergences": external_divergences,
+                "counter_observations": counter_observations,
+                "quality_divergence_count": len(quality_flags),
+                "quality_gate_capped_high": bool(downside["high_confidence"]) and not high,
+                "position_main_shares": position.main_shares,
+                "event_rank": 2 if high else 1,
+                **_liquidity_details(tech, shares, liquidity_rules, risk_exit=True),
+            }
+            if position.satellite.active:
+                action = "卫星仓退出，并分批降低主仓"
+                details["satellite_exit_shares"] = position.satellite.shares
+            if downside["gap_exception"]:
+                reason_prefix = "向下跳空后未收回支撑"
+            elif downside["persistent_break"]:
+                reason_prefix = "连续两根完整15分钟K收在动态支撑下方"
+            else:
+                reason_prefix = "完整15分钟深度跌破动态支撑"
+            if downside["critical_announcement"]:
+                reason_prefix += "且公司公告出现高风险事项"
+            external_note = "、".join(weak_sources) if weak_sources else "无"
+            divergence_note = (
+                f"；背离：{'、'.join(external_divergences)}"
+                if external_divergences
+                else ""
+            )
+            counter_note = (
+                f"；反向观察：{'、'.join(counter_observations)}"
+                if counter_observations
+                else ""
+            )
+            return Signal(
+                symbol=position.symbol,
+                name=position.name,
+                code="DOWN_BREAK",
+                confidence="高" if high else "中",
+                price=quote.price,
+                key_level=level,
+                action=action,
+                shares=shares,
+                reason=(
+                    f"{reason_prefix}、位于近似分时均价下方；"
+                    f"同时间量能{_fmt(tech.volume_ratio)}倍；外部确认：{external_note}"
+                    f"{divergence_note}{counter_note}"
+                ),
+                invalidation=f"完整15分钟重新站回{level:.2f}上方且板块止跌",
+                event_id=f"{today.isoformat()}|{position.symbol}:DOWN_BREAK:{level:.2f}",
+                category="strategy",
+                details=details,
+            )
 
     top_signal = (
         _stage_top_signal(position, quote, tech, today, stage, stage_rules, evidence)
@@ -2323,9 +2384,17 @@ def _downside_setup(
         (gap_exception and (weak_count >= 1 or critical))
         or critical
     )
+    gap_auto_high = _gap_qualifies_for_high_confidence(
+        gap_exception,
+        volume_confirmed,
+        tech.volume_ratio,
+        deep_break,
+        strategic_rules,
+        rules,
+    )
     high = bool(
-        gap_exception
-        or critical
+        critical
+        or gap_auto_high
         or (
             normal
             and (
@@ -2341,6 +2410,7 @@ def _downside_setup(
         "triggered": normal or exceptional,
         "high_confidence": high,
         "gap_exception": gap_exception,
+        "gap_auto_high": gap_auto_high,
         "critical_announcement": critical,
         "break_depth_ratio": break_depth_ratio,
         "break_depth_atr": break_depth_atr,
@@ -2628,6 +2698,232 @@ def _weak_confirmation_count(
         peer_change, market_change, evidence, rules, stock_change
     )
     return len(sources)
+
+
+def _gap_qualifies_for_high_confidence(
+    gap_exception: bool,
+    volume_confirmed: bool,
+    volume_ratio: float | None,
+    deep_break: bool,
+    strategic_rules: dict,
+    rules: dict,
+) -> bool:
+    if not gap_exception:
+        return False
+    if not bool(strategic_rules.get("gap_high_confidence_requires_volume", True)):
+        return True
+    min_ratio = float(
+        strategic_rules.get(
+            "gap_high_confidence_min_volume_ratio",
+            strategic_rules.get("volume_confirmation_ratio", 1.10),
+        )
+    )
+    volume_ok = volume_confirmed or (
+        volume_ratio is not None and volume_ratio >= min_ratio
+    )
+    if not volume_ok:
+        return False
+    if bool(strategic_rules.get("gap_high_confidence_requires_deep_break", False)):
+        return deep_break
+    return True
+
+
+def peers_stable_for_false_break(
+    peer_change: float | None,
+    peer_snapshots: list[tuple[str, float]] | None,
+    false_break_rules: dict,
+    strategic_rules: dict,
+) -> tuple[bool, str]:
+    if not bool(false_break_rules.get("enabled", True)):
+        peer_floor = float(strategic_rules.get("peer_weak_ratio", 0.0))
+        if peer_change is None:
+            return False, "同行数据暂缺"
+        return peer_change >= peer_floor, f"同行均值{peer_change:+.2%}"
+
+    mode = str(false_break_rules.get("peer_stability_mode", "relaxed_average"))
+    if mode == "none":
+        return True, "同行门控已关闭"
+
+    peer_floor = float(
+        false_break_rules.get(
+            "peer_minimum",
+            strategic_rules.get("peer_weak_ratio", 0.0),
+        )
+    )
+    if mode == "best_peer" and peer_snapshots:
+        leader_symbol, leader_change = max(peer_snapshots, key=lambda item: item[1])
+        return (
+            leader_change >= peer_floor,
+            f"最强同行{leader_symbol} {leader_change:+.2%}",
+        )
+    if peer_change is None:
+        return False, "同行数据暂缺"
+    return peer_change >= peer_floor, f"同行均值{peer_change:+.2%}"
+
+
+def low_volume_reclaim_bypasses_peers(
+    recovered: bool,
+    volume_ratio: float | None,
+    false_break_rules: dict,
+) -> bool:
+    if not recovered or not bool(false_break_rules.get("low_volume_reclaim_bypass_peers", True)):
+        return False
+    if volume_ratio is None:
+        return False
+    return volume_ratio <= float(false_break_rules.get("reclaim_max_volume_ratio", 1.0))
+
+
+def reduce_quality_flags(
+    *,
+    price: float,
+    support: float,
+    volume_ratio: float | None = None,
+    volume_threshold: float = 1.30,
+    stock_change: float | None = None,
+    peer_change: float | None = None,
+    peer_snapshots: list[tuple[str, float]] | None = None,
+    shareholder_signal: str = "missing",
+    commodity_option_view: str = "unavailable",
+    commodity_option_status: str = "not_applicable",
+    below_support_at_node: bool | None = None,
+    gap_exception: bool = False,
+    max_items: int = 5,
+) -> list[tuple[str, str]]:
+    flags: list[tuple[str, str]] = []
+    if volume_ratio is not None and volume_ratio < volume_threshold:
+        if gap_exception:
+            flags.append((
+                "low_volume_break",
+                f"跳空触发但同时间量能偏低（{volume_ratio:.2f}），破位质量偏弱",
+            ))
+        else:
+            flags.append((
+                "low_volume_break",
+                f"缩量破位（量能比{volume_ratio:.2f}），抛压确认不足",
+            ))
+    if below_support_at_node and price >= support:
+        flags.append((
+            "support_reclaimed",
+            f"最新价已站回支撑{support:.2f}，假跌破风险上升",
+        ))
+    if shareholder_signal == "concentrating":
+        flags.append(("holder_concentrating", "筹码集中与减仓方向背离"))
+    peer_note = _peer_reduce_divergence_note(stock_change, peer_change, peer_snapshots)
+    if peer_note:
+        flags.append(("peer_not_weak_together", peer_note))
+    if (
+        commodity_option_status == "fresh"
+        and commodity_option_view in {"balanced", "upside_demand"}
+    ):
+        view_text = {
+            "balanced": "结构均衡",
+            "upside_demand": "认购需求偏强",
+        }[commodity_option_view]
+        flags.append((
+            "options_balanced",
+            f"期权层{view_text}，未见恐慌性对冲",
+        ))
+    return flags[:max_items]
+
+
+def apply_reduce_quality_gates(
+    triggered: bool,
+    high: bool,
+    flags: list[tuple[str, str]],
+    strategic_rules: dict,
+    critical: bool = False,
+) -> tuple[bool, bool, list[str]]:
+    gates = strategic_rules.get("reduce_quality_gates") or {}
+    texts = [text for _, text in flags]
+    if not triggered or not bool(gates.get("enabled", True)):
+        return triggered, high, texts
+    if critical:
+        return triggered, high, texts
+
+    counted_keys = gates.get("counted_observations")
+    if counted_keys:
+        active = [item for item in flags if item[0] in counted_keys]
+    else:
+        active = flags
+    count = len(active)
+
+    max_high = gates.get("max_divergences_for_high_confidence")
+    if max_high is not None and count > int(max_high):
+        high = False
+
+    max_trigger = gates.get("max_divergences_for_trigger")
+    if max_trigger is not None and count > int(max_trigger):
+        triggered = False
+
+    return triggered, high, texts
+
+
+def reduce_quality_observations(
+    *,
+    price: float,
+    support: float,
+    volume_ratio: float | None = None,
+    volume_threshold: float = 1.30,
+    stock_change: float | None = None,
+    peer_change: float | None = None,
+    peer_snapshots: list[tuple[str, float]] | None = None,
+    shareholder_signal: str = "missing",
+    commodity_option_view: str = "unavailable",
+    commodity_option_status: str = "not_applicable",
+    below_support_at_node: bool | None = None,
+    gap_exception: bool = False,
+    max_items: int = 5,
+) -> list[str]:
+    return [
+        text
+        for _, text in reduce_quality_flags(
+            price=price,
+            support=support,
+            volume_ratio=volume_ratio,
+            volume_threshold=volume_threshold,
+            stock_change=stock_change,
+            peer_change=peer_change,
+            peer_snapshots=peer_snapshots,
+            shareholder_signal=shareholder_signal,
+            commodity_option_view=commodity_option_view,
+            commodity_option_status=commodity_option_status,
+            below_support_at_node=below_support_at_node,
+            gap_exception=gap_exception,
+            max_items=max_items,
+        )
+    ]
+
+
+def reduce_summary_context(summary: dict) -> bool:
+    """Whether a holding summary should append reduce-quality counter observations."""
+    if str(summary.get("role", "holding")) != "holding":
+        return False
+    price = summary.get("price")
+    support = summary.get("support")
+    if price is None or support is None:
+        return False
+    main_reduce = (summary.get("checks", {}) or {}).get("main_reduce", {}) or {}
+    below_item = main_reduce.get("below_support", {})
+    below_at_node = isinstance(below_item, dict) and bool(below_item.get("passed"))
+    break_item = main_reduce.get("break_depth_or_persistence", {})
+    break_at_node = isinstance(break_item, dict) and bool(break_item.get("passed"))
+    return bool(
+        float(price) < float(support)
+        or below_at_node
+        or (break_at_node and float(price) >= float(support))
+    )
+
+
+def _peer_reduce_divergence_note(
+    stock_change: float | None,
+    peer_change: float | None,
+    peer_snapshots: list[tuple[str, float]] | None,
+) -> str | None:
+    if peer_snapshots and stock_change is not None:
+        leader_symbol, leader_change = max(peer_snapshots, key=lambda item: item[1])
+        if leader_change > 0 and stock_change < -0.005:
+            return f"板块未集体走弱（{leader_symbol} {leader_change:+.2%}）"
+    return None
 
 
 def _peer_relative_strength(stock_change, peer_change, rules) -> tuple[bool, float | None]:

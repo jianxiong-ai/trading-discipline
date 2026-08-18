@@ -322,6 +322,10 @@ strategic_rules:
   minimum_reward_risk: 1.80
   max_remaining_risk_capacity_fraction: 0.10
   emergency_gap_down_ratio: 0.02
+  # 跳空例外仍可触发减仓，但高置信度须额外满足量能/深度门槛，避免缩量假破位直接给25%档。
+  gap_high_confidence_requires_volume: true
+  gap_high_confidence_min_volume_ratio: 1.0
+  gap_high_confidence_requires_deep_break: false
   down_break_min_depth_ratio: 0.003
   down_break_atr_multiplier: 0.10
   shallow_relative_strength_observation_only: true
@@ -329,6 +333,27 @@ strategic_rules:
   high_break_minimum_weak_confirmations: 2
   medium_confidence_reduction_ratio: 0.15
   high_confidence_reduction_ratio: 0.25
+
+# 假跌破撤销：价格收回支撑后，可撤销 pending 的 DOWN_BREAK 建议。
+false_break_rules:
+  enabled: true
+  peer_stability_mode: relaxed_average  # relaxed_average | best_peer | none
+  peer_minimum: -0.015
+  low_volume_reclaim_bypass_peers: true
+  reclaim_max_volume_ratio: 1.0
+
+# 反向观察降档：将第一层质量提示转化为置信度/触发门控。
+reduce_quality_gates:
+  enabled: true
+  max_divergences_for_high_confidence: 0
+  # 设为整数时，反向观察条数超过该值则完全不触发 DOWN_BREAK；默认 null 表示仅降档、不 suppress。
+  max_divergences_for_trigger: null
+  counted_observations:
+    - low_volume_break
+    - support_reclaimed
+    - holder_concentrating
+    - peer_not_weak_together
+    - options_balanced
 
 watchlist_rules:
   enabled: true
